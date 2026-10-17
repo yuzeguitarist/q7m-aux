@@ -1,0 +1,29 @@
+.github/.keep
+  s_898828b9e1d76b::t_8a77022e1fe478 1
+.github/workflows/nightly.yml
+  s_898828b9e1d76b::t_2797ac4e3a3249 1-69
+Summary.java
+  s_898828b9e1d76b::t_1031f82c030184 1-115
+audit.py
+  s_898828b9e1d76b::t_65c02b0f41d732 1-247
+runner.mjs
+  s_898828b9e1d76b::t_84b75bc6e8daf4 1-974
+tools/redteam-report-public.pem
+  s_898828b9e1d76b::t_156ce75088b79d 1-11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a2d64190debacba6c7d1a3df6cb4f3f4435abf6d",
+  "prompts": {},
+  "sessions": {
+    "s_898828b9e1d76b": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "4943b501-d049-4624-84dc-74154f514207",
+        "model": "grok-4.7"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
