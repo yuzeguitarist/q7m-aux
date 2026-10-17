@@ -48,6 +48,26 @@ function configuredAudience() {
   return value;
 }
 
+function configuredTerms(name, maxItems) {
+  const items = required(name).split(",").map(item => item.trim()).filter(Boolean);
+  if (!items.length || items.length > maxItems) throw new Error("missing configuration");
+  for (const item of items) {
+    if (!/^[A-Za-z0-9_$.:\/-]{1,80}$/.test(item)) throw new Error("missing configuration");
+  }
+  return items;
+}
+
+function analysisScriptArgs(patterns) {
+  const scoreRegex = required("SCORE_NAME_REGEX");
+  if (!/^[A-Za-z0-9_|]{1,200}$/.test(scoreRegex)) throw new Error("missing configuration");
+  return [
+    "@anchors", ...configuredTerms("ANCHOR_TERMS", 40),
+    "@fallback", ...configuredTerms("FALLBACK_PATTERNS", 8),
+    "@score", scoreRegex,
+    "@patterns", ...patterns,
+  ];
+}
+
 const STUDIO_ORIGIN = configuredOrigin();
 const STUDIO_AUDIENCE = configuredAudience();
 const PUBLIC_KEY_SHA256 = "4d7e08a1421e286e080dd7fba1b99b17696f38dba23ddcd2e0e402d10002c74a";
@@ -156,9 +176,9 @@ function studioEvent(kind, extra = {}, requiredDelivery = true) {
   return pending;
 }
 
-async function studioLog(phase, message, progress, status = undefined) {
+async function studioLog(phase, message, progress, status = undefined, force = false) {
   currentPhase = phase;
-  if (pendingStudioLogs >= 5) return;
+  if (pendingStudioLogs >= 5 && !force) return;
   pendingStudioLogs++;
   try {
     await studioEvent("log", { phase, message, progress, status }, false);
@@ -263,20 +283,38 @@ async function runStreaming(argv, options = {}) {
     stdio: ["ignore", "pipe", "pipe"],
   });
   let lastEventAt = 0;
+  let lineEventWindowStartedAt = Date.now();
   let lineEventCount = 0;
+  let highPriorityEventCount = 0;
   let heartbeatCount = 0;
+  const lineEventWindowMs = 15 * 60 * 1000;
+  const maxLineEventsPerWindow = 40;
+  const maxHighPriorityEventsPerWindow = 12;
+  const maxHeartbeats = 190;
   let outputPaused = false;
   const buffers = { stdout: "", stderr: "" };
 
   const emitLine = (line) => {
     const safe = cleanLogLine(line);
-    if (!safe || lineEventCount >= 40) return;
+    if (!safe) return;
     const now = Date.now();
-    const important = /error|fatal|warn|fail|exception|complete|decompil|analysis|import|processing|program|function/i.test(safe);
-    if (!important || now - lastEventAt < 2000) return;
+    if (now - lineEventWindowStartedAt >= lineEventWindowMs) {
+      lineEventWindowStartedAt = now;
+      lineEventCount = 0;
+      highPriorityEventCount = 0;
+    }
+    const important = /error|fatal|warn|fail|exception|complete|decompil|analysis|import|processing|program|function|path_explorer|budget|xcode cloud action/i.test(safe);
+    if (!important) return;
+    const highPriority = /\b(error|fatal|fail\w*|exception|timeout|timed out)\b/i.test(safe);
+    if (highPriority) {
+      if (highPriorityEventCount >= maxHighPriorityEventsPerWindow) return;
+      highPriorityEventCount++;
+    } else {
+      if (lineEventCount >= maxLineEventsPerWindow || now - lastEventAt < 2000) return;
+      lineEventCount++;
+    }
     lastEventAt = now;
-    lineEventCount++;
-    void studioLog(phase, safe, progressValue, statusValue);
+    void studioLog(phase, safe, progressValue, statusValue, highPriority);
   };
 
   const consume = (name, chunk) => {
@@ -313,8 +351,9 @@ async function runStreaming(argv, options = {}) {
   child.stdout.on("data", chunk => consume("stdout", chunk));
   child.stderr.on("data", chunk => consume("stderr", chunk));
   const heartbeat = setInterval(() => {
-    if (heartbeatCount >= 20 || Date.now() - lastEventAt < 14000) return;
-    lastEventAt = Date.now();
+    const now = Date.now();
+    if (heartbeatCount >= maxHeartbeats || now - lastEventAt < 59000) return;
+    lastEventAt = now;
     heartbeatCount++;
     const name = String(argv[0]).split(/[\\/]/).pop() || "process";
     void studioLog(phase, "Still running: " + name + ".", progressValue, statusValue);
@@ -481,7 +520,9 @@ async function cloudRuns() {
 
 async function buildRun(id) {
   const data = await studioCloud("build", { id });
-  return data?.data;
+  const row = data?.data;
+  if (row && Array.isArray(data.actions)) row.__redTeamActions = data.actions;
+  return row;
 }
 
 async function startBuild() {
@@ -502,21 +543,50 @@ async function getArchive(id) {
 async function waitForBuild(id, expectedSha) {
   let current = await buildRun(id);
   if (!current) throw new Error("cloud build unavailable");
-  const deadline = Date.now() + 3 * 60 * 60 * 1000;
+  const deadline = Date.now() + 75 * 60 * 1000;
+  const seenActions = new Map();
+  let lastBuildState = "";
+  let lastHeartbeatAt = Date.now();
+  const logActionChanges = async (build) => {
+    const actions = Array.isArray(build?.__redTeamActions) ? build.__redTeamActions : [];
+    for (const action of actions.slice(0, 20)) {
+      const issueCounts = action?.issueCounts && typeof action.issueCounts === "object" ? action.issueCounts : null;
+      const issueText = issueCounts
+        ? Object.entries(issueCounts).map(([key, value]) => key + "=" + value).join(", ")
+        : "issue counts unavailable";
+      const state = [action?.executionProgress, action?.completionStatus, issueText].join("|");
+      if (!action?.id || seenActions.get(action.id) === state) continue;
+      seenActions.set(action.id, state);
+      const name = String(action.name || action.actionType || "Build action").slice(0, 120);
+      const started = typeof action.startedDate === "string" ? Date.parse(action.startedDate) : NaN;
+      const elapsed = Number.isFinite(started) ? "; elapsed " + Math.max(0, Math.floor((Date.now() - started) / 60000)) + "m" : "";
+      await studioLog("cloud_build_action", "Xcode Cloud action " + name + ": " + String(action.executionProgress || "UNKNOWN") + " / " + String(action.completionStatus || "UNKNOWN") + "; " + issueText + elapsed + ".", 14, "waiting_build");
+    }
+  };
+  await logActionChanges(current);
   while (!terminal(current) && Date.now() < deadline) {
     await new Promise(resolvePromise => setTimeout(resolvePromise, 60000));
     current = await buildRun(id);
     if (!current) throw new Error("cloud build unavailable");
+    await logActionChanges(current);
     const state = progress(current) || completion(current) || "RUNNING";
     const pct = ["COMPLETE", "COMPLETED", "FINISHED"].includes(state) ? 48 : 10;
-    await studioLog("cloud_build", "Xcode Cloud: " + state.toLowerCase() + ".", pct, "waiting_build");
+    if (state !== lastBuildState) {
+      await studioLog("cloud_build", "Xcode Cloud build state: " + state.toLowerCase() + ".", pct, "waiting_build");
+      lastBuildState = state;
+      lastHeartbeatAt = Date.now();
+    } else if (Date.now() - lastHeartbeatAt >= 5 * 60 * 1000) {
+      await studioLog("cloud_build", "Xcode Cloud build remains " + state.toLowerCase() + "; action states were checked.", pct, "waiting_build");
+      lastHeartbeatAt = Date.now();
+    }
   }
-  if (!terminal(current)) throw new Error("cloud build timeout");
+  await logActionChanges(current);
+  if (!terminal(current)) throw new Error("cloud build timeout after 75 minutes");
   const actualSha = commitShaFrom(current);
   if (!successful(current)) throw new Error("cloud build failed");
   if (!actualSha) throw new Error("cloud build source commit unavailable");
   if (actualSha !== expectedSha.toLowerCase()) throw new Error("cloud build commit mismatch");
-  await studioLog("cloud_build", "Release build completed for the expected source commit.", 48, "analyzing");
+  await studioLog("cloud_build", "Xcode Cloud build completed for the expected source commit.", 48, "analyzing");
   return { run: current, actualSha };
 }
 
@@ -614,7 +684,161 @@ else:
   return dir;
 }
 
-function publicSummary(publicAudit, ghidraRows, sourceChanged, actualSha) {
+function mergeExplorations(ghidraRows, budgetSeconds) {
+  const nodeMap = new Map();
+  const nodesByImage = new Map();
+  const rawEdges = [];
+  const rawPaths = [];
+  const unresolved = new Set();
+  let elapsedSeconds = 0;
+  let analysisPasses = 0;
+  let imageCount = 0;
+  let decompilationAttempts = 0;
+  let decompilationFailures = 0;
+  let styleVariations = 0;
+  let totalVisitedFunctions = 0;
+
+  for (const row of ghidraRows.filter(Boolean)) {
+    const exploration = row.exploration;
+    if (!exploration || typeof exploration !== "object") continue;
+    imageCount++;
+    elapsedSeconds += Math.max(0, Number(exploration.elapsed_seconds) || 0);
+    analysisPasses += Math.max(0, Number(exploration.analysis_passes) || 0);
+    decompilationAttempts += Math.max(0, Number(exploration.summary?.decompilation_attempt_count) || 0);
+    decompilationFailures += Math.max(0, Number(exploration.summary?.decompilation_failure_count) || 0);
+    styleVariations += Math.max(0, Number(exploration.summary?.style_variation_count) || 0);
+    totalVisitedFunctions += Math.max(0, Number(exploration.summary?.visited_function_count) || (Array.isArray(exploration.nodes) ? exploration.nodes.length : 0));
+    const image = String(row.image || "unknown-image");
+    const imageNodes = [];
+    for (const node of Array.isArray(exploration.nodes) ? exploration.nodes : []) {
+      if (!node || typeof node.id !== "string") continue;
+      nodeMap.set(node.id, node);
+      imageNodes.push(node);
+    }
+    imageNodes.sort((a, b) => Number(b.seed) - Number(a.seed) || (Number(b.score) || 0) - (Number(a.score) || 0));
+    nodesByImage.set(image, imageNodes);
+    for (const edge of Array.isArray(exploration.edges) ? exploration.edges : []) {
+      if (edge && typeof edge.from === "string" && typeof edge.to === "string") rawEdges.push(edge);
+    }
+    for (const path of Array.isArray(exploration.paths) ? exploration.paths : []) {
+      if (!path || !Array.isArray(path.node_ids) || path.node_ids.length < 2) continue;
+      rawPaths.push({ ...path, id: image + ":" + String(path.id || "path"), image });
+    }
+    for (const pattern of Array.isArray(exploration.unresolved_seed_patterns) ? exploration.unresolved_seed_patterns : []) {
+      if (typeof pattern === "string") unresolved.add(pattern);
+    }
+  }
+
+  rawPaths.sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0));
+  const selectedNodes = new Map();
+  const selectedPaths = [];
+  for (const path of rawPaths) {
+    const pathIds = path.node_ids.filter(id => typeof id === "string" && nodeMap.has(id));
+    if (pathIds.length < 2) continue;
+    const newIds = pathIds.filter(id => !selectedNodes.has(id));
+    if (selectedNodes.size + newIds.length > 120) continue;
+    for (const id of pathIds) selectedNodes.set(id, nodeMap.get(id));
+    selectedPaths.push({ ...path, node_ids: pathIds.slice(0, 16) });
+    if (selectedPaths.length >= 30) break;
+  }
+
+  let changed = true;
+  let round = 0;
+  const imageEntries = [...nodesByImage.entries()];
+  while (selectedNodes.size < 120 && changed) {
+    changed = false;
+    for (const [, imageNodes] of imageEntries) {
+      const node = imageNodes[round];
+      if (!node || selectedNodes.has(node.id)) continue;
+      selectedNodes.set(node.id, node);
+      changed = true;
+      if (selectedNodes.size >= 120) break;
+    }
+    round++;
+  }
+
+  const selectedIds = new Set(selectedNodes.keys());
+  const edgeByKey = new Map();
+  for (const edge of rawEdges) {
+    if (!selectedIds.has(edge.from) || !selectedIds.has(edge.to)) continue;
+    const key = edge.from + "->" + edge.to;
+    if (!edgeByKey.has(key)) edgeByKey.set(key, edge);
+  }
+
+  // Preserve every edge required by a displayed path before filling the graph with context edges.
+  const paths = [];
+  const requiredEdgeKeys = new Set();
+  for (const path of selectedPaths) {
+    if (!path.node_ids.every(id => selectedIds.has(id))) continue;
+    const pathEdgeKeys = [];
+    let complete = true;
+    for (let i = 1; i < path.node_ids.length; i++) {
+      const key = path.node_ids[i - 1] + "->" + path.node_ids[i];
+      if (!edgeByKey.has(key)) {
+        complete = false;
+        break;
+      }
+      pathEdgeKeys.push(key);
+    }
+    if (!complete) continue;
+    const newKeys = pathEdgeKeys.filter(key => !requiredEdgeKeys.has(key));
+    if (requiredEdgeKeys.size + new Set(newKeys).size > 400) continue;
+    for (const key of pathEdgeKeys) requiredEdgeKeys.add(key);
+    paths.push(path);
+    if (paths.length >= 30) break;
+  }
+
+  const edges = [];
+  const edgeKeys = new Set();
+  for (const key of requiredEdgeKeys) {
+    const edge = edgeByKey.get(key);
+    if (edge) {
+      edgeKeys.add(key);
+      edges.push(edge);
+    }
+  }
+  for (const edge of rawEdges) {
+    if (edges.length >= 400) break;
+    if (!selectedIds.has(edge.from) || !selectedIds.has(edge.to)) continue;
+    const key = edge.from + "->" + edge.to;
+    if (edgeKeys.has(key)) continue;
+    edgeKeys.add(key);
+    edges.push(edge);
+  }
+  const nodes = [...selectedNodes.values()];
+  const allImagesCompleted = ghidraRows.length > 0 && ghidraRows.every(row => row?.analysis_status === "completed");
+  const budgetReached = allImagesCompleted
+    && imageCount === ghidraRows.length
+    && elapsedSeconds >= budgetSeconds
+    && decompilationAttempts > 0;
+  const summary = {
+    seed_count: ghidraRows.reduce((total, row) => total + Math.max(0, Number(row?.exploration?.summary?.seed_count) || 0), 0),
+    visited_function_count: totalVisitedFunctions,
+    edge_count: rawEdges.length,
+    path_count: paths.length,
+    decompiled_function_count: ghidraRows.reduce((total, row) => total + Math.max(0, Number(row?.decompiled_function_count) || 0), 0),
+    decompilation_attempt_count: decompilationAttempts,
+    decompilation_failure_count: decompilationFailures,
+    style_variation_count: styleVariations,
+    analysis_pass_count: analysisPasses,
+    analysis_budget_reached: budgetReached,
+  };
+  return {
+    schema: 1,
+    image_count: imageCount,
+    budget_seconds: budgetSeconds,
+    elapsed_seconds: Math.floor(elapsedSeconds),
+    analysis_passes: analysisPasses,
+    budget_reached: budgetReached,
+    nodes,
+    edges,
+    paths,
+    unresolved_seed_patterns: [...unresolved].slice(0, 40),
+    summary,
+  };
+}
+
+function publicSummary(publicAudit, ghidraRows, sourceChanged, actualSha, exploration) {
   const p = publicAudit.public;
   const g = ghidraRows.filter(Boolean);
   const totalFunctions = g.reduce((n, row) => n + (row.function_count || 0), 0);
@@ -622,7 +846,12 @@ function publicSummary(publicAudit, ghidraRows, sourceChanged, actualSha) {
   const decompiled = g.reduce((n, row) => n + (row.decompiled_function_count || 0), 0);
   const nontrivial = g.reduce((n, row) => n + (row.nontrivial_decompilation_count || 0), 0);
   const semantic = g.reduce((n, row) => n + (row.semantic_name_count || 0), 0);
-  const ghidraFailures = g.filter(row => row.analysis_status === "failed").length;
+  const ghidraFailures = g.filter(row => row.analysis_status !== "completed").length;
+  const decompilationAttempts = Number(exploration?.summary?.decompilation_attempt_count) || 0;
+  const decompilationFailures = Number(exploration?.summary?.decompilation_failure_count) || 0;
+  const styleVariations = Number(exploration?.summary?.style_variation_count) || 0;
+  const autoAnalysisTimeouts = g.filter(row => row.auto_analysis_timed_out === true).length;
+  const decompilationFailureRate = decompilationAttempts ? decompilationFailures / decompilationAttempts : 0;
   const risks = [];
   if (p.encrypted_flags) risks.push("encrypted-input");
   if (p.debug_sections || p.llvm_sections) risks.push("build-metadata-exposure");
@@ -634,6 +863,12 @@ function publicSummary(publicAudit, ghidraRows, sourceChanged, actualSha) {
   if (p.tool_failure_count) risks.push("binary-tool-failure");
   if (p.export_commands && p.defined_symbols) risks.push("symbol-surface");
   if (ghidraFailures) risks.push("ghidra-analysis-incomplete");
+  if (autoAnalysisTimeouts) risks.push("ghidra-auto-analysis-timeout");
+  if (exploration?.budget_reached !== true) risks.push("analysis-budget-not-reached");
+  if (!Array.isArray(exploration?.paths) || exploration.paths.length === 0) risks.push("function-path-exploration-empty");
+  if (Array.isArray(exploration?.unresolved_seed_patterns) && exploration.unresolved_seed_patterns.length) risks.push("high-value-seed-unmatched");
+  if (decompiled === 0) risks.push("no-functions-decompiled");
+  if (decompilationFailureRate >= 0.25) risks.push("decompilation-failure-rate-high");
   const decompRate = selected ? decompiled / selected : 0;
   const semanticRate = totalFunctions ? semantic / totalFunctions : 0;
   return {
@@ -666,6 +901,7 @@ function publicSummary(publicAudit, ghidraRows, sourceChanged, actualSha) {
     ghidra_images: g.length,
     ghidra_analyzed_images: g.length - ghidraFailures,
     ghidra_failed_images: ghidraFailures,
+    ghidra_auto_analysis_timeout_count: autoAnalysisTimeouts,
     ghidra_functions: totalFunctions,
     ghidra_selected_functions: selected,
     ghidra_decompiled_functions: decompiled,
@@ -673,6 +909,18 @@ function publicSummary(publicAudit, ghidraRows, sourceChanged, actualSha) {
     ghidra_decompilation_rate: Number(decompRate.toFixed(4)),
     ghidra_semantic_name_count: semantic,
     ghidra_semantic_name_rate: Number(semanticRate.toFixed(4)),
+    incomplete_check_count: (p.tool_failure_count || 0) + ghidraFailures + (exploration?.budget_reached === true ? 0 : 1) + (decompiled === 0 ? 1 : 0) + (decompilationFailureRate >= 0.25 ? 1 : 0),
+    ghidra_decompilation_attempt_count: decompilationAttempts,
+    ghidra_decompilation_failure_count: decompilationFailures,
+    ghidra_style_variation_count: styleVariations,
+    exploration_seed_count: Number(exploration?.summary?.seed_count) || 0,
+    exploration_node_count: Number(exploration?.summary?.visited_function_count) || 0,
+    exploration_edge_count: Number(exploration?.summary?.edge_count) || 0,
+    exploration_path_count: Number(exploration?.summary?.path_count) || 0,
+    analysis_budget_seconds: Number(exploration?.budget_seconds) || 10800,
+    analysis_elapsed_seconds: Number(exploration?.elapsed_seconds) || 0,
+    analysis_pass_count: Number(exploration?.analysis_passes) || 0,
+    analysis_budget_reached: exploration?.budget_reached === true,
     risk_flags: risks,
     engine: "macho-release-v1"
   };
@@ -738,7 +986,7 @@ function failureMessage(error) {
   if (message.includes("for /api/redteam/ingest") && message.includes("(413)")) return "The encrypted report exceeded Studio’s request-size limit.";
   if (message.includes("studio request failed (401)") || message.includes("studio request failed (403)")) return "Studio rejected the workflow identity or report request.";
   if (message.includes("studio request failed")) return "Studio did not accept a workflow update (HTTP " + ((message.match(/\((\d{3})\)/) || [])[1] || "unknown") + ").";
-  if (message.includes("cloud build timeout")) return "Xcode Cloud did not finish within the three-hour wait window.";
+  if (message.includes("cloud build timeout")) return "Xcode Cloud did not finish within the 75-minute build wait window.";
   if (message.includes("cloud build commit mismatch")) return "Xcode Cloud built a different source commit; the report was not accepted.";
   if (message.includes("cloud build failed")) return "The Xcode Cloud Release build failed.";
   if (message.includes("archive download failed") || message.includes("archive download unavailable")) return "The Xcode Cloud archive download failed.";
@@ -869,31 +1117,64 @@ async function main() {
     const maxImages = Number.isFinite(configuredMaxImages) && configuredMaxImages > 0
       ? Math.min(12, Math.max(1, Math.floor(configuredMaxImages)))
       : 12;
+    const machoPriority = (path) => {
+      const normalized = path.replace(/\\/g, "/");
+      if (/\.app\/Contents\/MacOS\/[^/]+$/i.test(normalized) || /\.app\/[^/]+$/i.test(normalized)) return 0;
+      if (/\.appex\/Contents\/MacOS\/[^/]+$/i.test(normalized) || /\.appex\/[^/]+$/i.test(normalized)) return 1;
+      if (/\.framework\/(?:Versions\/[^/]+\/)?[^/]+$/i.test(normalized)) return 2;
+      if (/\.dylib$/i.test(normalized)) return 3;
+      return 4;
+    };
+    machos.sort((left, right) => machoPriority(left) - machoPriority(right) || left.localeCompare(right));
     const selectedMachos = machos.slice(0, maxImages);
+    await studioLog(
+      "ghidra",
+      "Prioritized Mach-O images: " + selectedMachos.map(path => path.slice(preferred.length).replace(/^\/+/, "")).join(", ").slice(0, 400) + ".",
+      58,
+      "analyzing"
+    );
+    const configuredBudgetMinutes = Number(policy.analysis?.analysisBudgetMinutes);
+    const analysisBudgetMinutes = Number.isFinite(configuredBudgetMinutes) ? Math.max(180, Math.floor(configuredBudgetMinutes)) : 180;
+    const analysisBudgetSeconds = analysisBudgetMinutes * 60;
+    const configuredPerImageCeiling = Number(policy.analysis?.maxGhidraMinutesPerImage);
+    const configuredPerImageCeilingMinutes = Number.isFinite(configuredPerImageCeiling) ? Math.min(180, Math.max(1, Math.floor(configuredPerImageCeiling))) : 180;
+    const requiredPerImageMinutes = Math.ceil(analysisBudgetMinutes / selectedMachos.length);
+    const perImageCeiling = Math.max(configuredPerImageCeilingMinutes, requiredPerImageMinutes);
+    if (perImageCeiling > configuredPerImageCeilingMinutes) {
+      await studioLog("ghidra", "Raised the legacy per-image ceiling from " + configuredPerImageCeilingMinutes + " to " + perImageCeiling + " minutes so all selected images can cover the full analysis budget.", 59, "analyzing");
+    }
+    const highValuePatterns = Array.isArray(policy.analysis?.highValueFunctionPatterns)
+      ? policy.analysis.highValueFunctionPatterns.filter(pattern => typeof pattern === "string" && /^[A-Za-z0-9_$.:/-]{1,80}$/.test(pattern)).slice(0, 40)
+      : [];
+    if (!highValuePatterns.length) throw new Error("high-value function patterns unavailable");
     const ghidraRows = [];
+    let remainingAnalysisMs = analysisBudgetSeconds * 1000;
 
     for (let i = 0; i < selectedMachos.length; i++) {
       const input = selectedMachos[i];
-      await studioPhase("ghidra", "Analyzing Mach-O image " + (i + 1) + " of " + selectedMachos.length + ".", 60 + Math.floor((i / Math.max(1, selectedMachos.length)) * 30), "analyzing");
+      const remainingImages = selectedMachos.length - i;
+      const sliceMs = Math.ceil(remainingAnalysisMs / Math.max(1, remainingImages));
+      const sliceSeconds = Math.max(60, Math.min(perImageCeiling * 60, Math.ceil(sliceMs / 1000)));
+      const imageStartedAt = Date.now();
+      await studioPhase("ghidra", "Exploring Mach-O image " + (i + 1) + " of " + selectedMachos.length + " for up to " + Math.round(sliceSeconds / 60) + " minutes.", 60 + Math.floor((i / Math.max(1, selectedMachos.length)) * 30), "analyzing");
       const projectDir = join(tmpDir, "g-" + i);
       await mkdir(projectDir, { recursive: true });
       const rowPath = join(tmpDir, "g-" + i + ".json");
       const logPath = join(tmpDir, "g-" + i + ".log");
-      const configuredMinutes = Number(policy.analysis?.maxGhidraMinutesPerImage);
-      const maxGhidraMinutes = Number.isFinite(configuredMinutes) && configuredMinutes > 0
-        ? Math.min(7, Math.max(1, configuredMinutes))
-        : 5;
+      const maxGhidraMinutes = Math.min(perImageCeiling, Math.max(1, Math.ceil(sliceSeconds / 60)));
       const relativeImage = input.slice(preferred.length).replace(/^\/+/, "") || input.split("/").pop() || "unknown-image";
       let result = { status: 1 };
       let processErrorCode = null;
+      let autoAnalysisTimedOut = false;
       try {
         result = await runStreaming([ghidra, projectDir, "p" + i, "-import", input,
-          "-scriptPath", tmpDir, "-postScript", "Summary.java", rowPath,
-          "-analysisTimeoutPerFile", String(maxGhidraMinutes * 60),
+          "-scriptPath", tmpDir, "-postScript", "Summary.java", rowPath, relativeImage,
+          String(sliceSeconds), "targeted", ...analysisScriptArgs(highValuePatterns),
+          "-analysisTimeoutPerFile", String(Math.min(5, maxGhidraMinutes) * 60),
           "-deleteProject"], {
           phase: "ghidra",
           progress: 60 + Math.floor((i / Math.max(1, selectedMachos.length)) * 30),
-          timeout: 8 * 60 * 1000,
+          timeout: sliceMs + 6 * 60 * 1000,
           logPath
         });
       } catch (error) {
@@ -901,21 +1182,34 @@ async function main() {
       }
 
       let row = null;
-      if (result.status === 0 && existsSync(rowPath)) {
+      if (existsSync(rowPath)) {
         try {
           const parsed = JSON.parse(await readFile(rowPath, "utf8"));
           if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) row = parsed;
         } catch {}
       }
+      if (row?.auto_analysis_timed_out === true) autoAnalysisTimedOut = true;
+      const elapsedReportedMs = Number(row?.exploration?.elapsed_seconds) * 1000;
+      const elapsedForBudget = Number.isFinite(elapsedReportedMs) && elapsedReportedMs > 0 ? elapsedReportedMs : Date.now() - imageStartedAt;
+      remainingAnalysisMs = Math.max(0, remainingAnalysisMs - Math.min(sliceMs, Math.max(0, elapsedForBudget)));
       if (row) {
         row.image = relativeImage;
-        row.analysis_status = "completed";
+        if (autoAnalysisTimedOut) row.auto_analysis_timed_out = true;
+      }
+      if (row && result.status === 0 && !autoAnalysisTimedOut) {
+        row.analysis_status = row.analysis_budget_reached === true ? "completed" : "failed";
+        if (row.analysis_status !== "completed") row.error_code = "analysis_budget_not_reached";
+        ghidraRows.push(row);
+      } else if (row) {
+        row.analysis_status = "failed";
+        row.error_code = autoAnalysisTimedOut ? "auto_analysis_timeout" : processErrorCode || "process_failed_after_partial_report";
         ghidraRows.push(row);
       } else {
         ghidraRows.push({
           image: relativeImage,
           analysis_status: "failed",
-          error_code: processErrorCode || (result.status === 0 ? "summary_invalid" : "process_failed"),
+          auto_analysis_timed_out: autoAnalysisTimedOut,
+          error_code: autoAnalysisTimedOut ? "auto_analysis_timeout" : processErrorCode || (result.status === 0 ? "summary_invalid" : "process_failed"),
           function_count: 0,
           selected_function_count: 0,
           decompiled_function_count: 0,
@@ -925,8 +1219,9 @@ async function main() {
       }
     }
 
-    await studioPhase("report", "Building and encrypting the detailed report.", 94, "finalizing");
-    const summary = publicSummary(auditPayload, ghidraRows, true, actualSha);
+    await studioPhase("report", "Merging function paths and encrypting the detailed report.", 94, "finalizing");
+    const exploration = mergeExplorations(ghidraRows, analysisBudgetSeconds);
+    const summary = publicSummary(auditPayload, ghidraRows, true, actualSha, exploration);
     const privateReport = {
       schema: 1,
       observed_at: new Date().toISOString(),
@@ -936,6 +1231,7 @@ async function main() {
       build_run_id: buildId,
       audit: auditPayload.private,
       ghidra: ghidraRows,
+      exploration,
       summary
     };
 
@@ -946,15 +1242,26 @@ async function main() {
     await rm(privatePath, { force: true });
 
     await writeFile(join(outDir, "summary.json"), safeJson(summary));
+    const analysisBudgetReached = exploration.budget_reached === true;
     await writeFile(join(outDir, "status.json"), safeJson({
       schema: 1,
-      status: "completed",
+      status: analysisBudgetReached ? "completed" : "failed",
       encrypted_details: true,
       report_uploaded: Boolean(uploaded?.ok),
       ghidra_images: ghidraRows.length,
+      analysis_budget_seconds: exploration.budget_seconds,
+      analysis_elapsed_seconds: exploration.elapsed_seconds,
+      analysis_budget_reached: analysisBudgetReached,
+      exploration_paths: exploration.paths.length,
       risk_flags: summary.risk_flags
     }));
 
+    if (!analysisBudgetReached) {
+      const message = "Active Ghidra analysis budget not reached: " + exploration.elapsed_seconds + " of " + exploration.budget_seconds + " seconds; partial encrypted evidence was uploaded.";
+      await studioEvent("fail", { phase: "failed", progress: 100, message }, false);
+      await status("failed", { reason: "analysis_budget_not_reached" });
+      return 1;
+    }
     return 0;
   } catch (error) {
     if (studioStarted) {
