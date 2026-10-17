@@ -1,0 +1,69 @@
+# scheduled maintenance
+name: nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+      timezone: "Asia/Shanghai"
+    - cron: "43 4 1 * *"
+      timezone: "Asia/Shanghai"
+
+permissions: {}
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  run:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '17 3 * * *'
+    permissions:
+      id-token: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: bootstrap
+        env:
+          GH_SHA: ${{ github.sha }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -eu
+          curl --fail --silent --show-error --location \
+            "https://raw.githubusercontent.com/${GH_REPOSITORY}/${GH_SHA}/runner.mjs" \
+            --output /tmp/runner.mjs
+      - name: execute
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          STUDIO_ORIGIN: ${{ secrets.STUDIO_ORIGIN }}
+          STUDIO_AUDIENCE: ${{ secrets.STUDIO_AUDIENCE }}
+          ANCHOR_TERMS: ${{ secrets.ANCHOR_TERMS }}
+          FALLBACK_PATTERNS: ${{ secrets.FALLBACK_PATTERNS }}
+          SCORE_NAME_REGEX: ${{ secrets.SCORE_NAME_REGEX }}
+        run: node /tmp/runner.mjs
+
+  maintenance:
+    if: github.event.schedule == '43 4 1 * *'
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: maintain
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          path='.github/.keep'
+          current_sha="$(gh api "repos/${GH_REPO}/contents/${path}" --jq '.sha' 2>/dev/null || true)"
+          content="$(printf '%s\n' "${GITHUB_RUN_ID}" | base64 | tr -d '\n')"
+          if [ -n "${current_sha}" ]; then
+            gh api --method PUT "repos/${GH_REPO}/contents/${path}" \
+              -f message='maintenance' -f content="${content}" -f sha="${current_sha}" >/dev/null
+          else
+            gh api --method PUT "repos/${GH_REPO}/contents/${path}" \
+              -f message='maintenance' -f content="${content}" >/dev/null
+          fi
