@@ -1,0 +1,19 @@
+.github/workflows/nightly.yml
+  s_6661fbbe81ca97::t_8b6456345899c4 5,20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "21067e93064dff3f4d5ddf328038780b9aac06bd",
+  "prompts": {},
+  "sessions": {
+    "s_6661fbbe81ca97": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08bffd58-be1c-4219-b412-7b4c497dbb31",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
