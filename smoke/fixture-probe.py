@@ -1,9 +1,11 @@
 import json
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import sys
 import time
+import uuid
 
 config = json.loads(Path("fixture-config.json").read_text())
 checks = []
@@ -56,6 +58,17 @@ if sys.argv[1] == "macos":
             "-s", "smoke-own", "-w", own]).strip() == "synthetic-value-not-a-secret")
     require("host keychain denied", command(["/usr/bin/security", "find-generic-password", "-a", "synthetic",
             "-s", "smoke-host", "-w", config["hostKeychain"]]).returncode != 0)
+    label = "com.example.isolation-smoke." + uuid.uuid4().hex
+    service = "user/" + str(os.getuid()) + "/" + label
+    plist = Path.cwd() / "isolation-service.plist"
+    plist.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": ["/bin/sleep", "600"],
+                                     "KeepAlive": True, "RunAtLoad": True}))
+    succeeds(["/bin/launchctl", "bootstrap", "user/" + str(os.getuid()), str(plist)])
+    service_pid = succeeds(["/bin/launchctl", "kickstart", "-p", service]).strip()
+    require("own launchd service running", service_pid.isdigit() and succeeds(
+        ["/bin/ps", "-o", "uid=", "-p", service_pid]).strip() == str(os.getuid()))
+    succeeds(["/bin/launchctl", "print", service])
+    result["serviceLabel"] = label
     if config["mode"] == "success":
         succeeds(["/usr/bin/xcrun", "swiftc", "keychain-probe.swift", "-o", "keychain-probe"])
         succeeds([str(Path.cwd() / "keychain-probe")])

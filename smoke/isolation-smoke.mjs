@@ -141,17 +141,11 @@ async function main() {
         const accountOutput = await run('/usr/bin/dscl', ['.', '-read', `/Users/${account}`]).catch(() => null);
         assert.ok(accountOutput === null,
           `isolated Directory Services account still exists after cleanup; first output: ${firstLine(accountOutput)}`);
-        const domainOutput = await run('/usr/bin/sudo', ['-n', '/bin/launchctl', 'print', `user/${observed.uid}`]).catch(() => null);
-        if (domainOutput !== null) {
-          const bootout = await domainDiagnostic('bootout', observed.uid);
-          const reprint = await domainDiagnostic('print', observed.uid);
-          const hasProcesses = (await run('/bin/ps', ['-axo', 'uid='])).trim().split(/\s+/).includes(String(observed.uid));
-          result.userDomainCleanupDiagnostic = { bootout, reprint, hasProcesses };
-          console.log(`DIAGNOSTIC macos cleanup: ${JSON.stringify(result.userDomainCleanupDiagnostic)}`);
-          assert.equal(hasProcesses, false, 'no process may survive under the isolated UID');
-        }
-        assert.ok(domainOutput === null,
-          `isolated launchd user domain still exists after cleanup; first output: ${firstLine(domainOutput)}`);
+        assert.match(observed.serviceLabel, /^com\.example\.isolation-smoke\.[0-9a-f]{32}$/);
+        const serviceOutput = await run('/usr/bin/sudo', ['-n', '/bin/launchctl', 'print',
+          `user/${observed.uid}/${observed.serviceLabel}`]).catch(() => null);
+        assert.ok(serviceOutput === null,
+          `isolated launchd service still exists after cleanup; first output: ${firstLine(serviceOutput)}`);
         assert.equal((await run('/bin/ps', ['-axo', 'uid='])).trim().split(/\s+/).includes(String(observed.uid)), false,
           'no process may survive under the isolated UID');
         if (observed.simulator) {
