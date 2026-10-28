@@ -58,6 +58,7 @@ jobs:
           compression-level: 0
 
       - name: Complete
+        if: always()
         env:
           TASK_PAYLOAD: ${{ inputs.payload }}
           TASK_PLATFORM: ${{ inputs.platform }}
