@@ -23,6 +23,10 @@ def command(args, timeout=180):
 
 def succeeds(args, timeout=180):
     result = command(args, timeout)
+    if Path(args[0]).name == "launchctl" and result.returncode != 0:
+        detail = " ".join((result.stderr or result.stdout).split())[:200]
+        raise RuntimeError("assertion failed: command launchctl " + args[1]
+                           + " exit=" + str(result.returncode) + " output=" + (detail or "(empty)"))
     require("command " + Path(args[0]).name, result.returncode == 0)
     return result.stdout
 
