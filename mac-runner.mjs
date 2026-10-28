@@ -46,7 +46,6 @@ export async function isolateMac(source, environment) {
     const keychain = `${home}/Library/Keychains/login.keychain-db`;
     await asUser('/usr/bin/security', ['create-keychain', '-p', '', keychain]);
     await asUser('/usr/bin/security', ['default-keychain', '-d', 'user', '-s', keychain]);
-    await asUser('/usr/bin/security', ['set-keychain-settings', '-lut', '7200', keychain]);
     await asUser('/usr/bin/security', ['unlock-keychain', '-p', '', keychain]);
     return { source: `${home}/source`, args, stop: () => root('/usr/bin/pkill', ['-KILL', '-u', String(uid)]), cleanup };
   } catch (error) {
