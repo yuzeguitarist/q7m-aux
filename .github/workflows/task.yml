@@ -28,6 +28,7 @@ jobs:
   execute:
     name: Execute
     if: github.actor == github.repository_owner && github.ref == 'refs/heads/main'
+    environment: ci-relay
     runs-on: ${{ inputs.platform == 'macos' && 'macos-26' || 'ubuntu-latest' }}
     timeout-minutes: 65
     steps:
@@ -43,7 +44,7 @@ jobs:
           TASK_GROUP: ${{ inputs.group }}
           CI_RELAY_KEY: ${{ secrets.CI_RELAY_KEY }}
           CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
-          CI_SOURCE_TOKEN: ${{ secrets.CI_SOURCE_TOKEN }}
+          CI_SOURCE_READ_TOKEN: ${{ secrets.CI_SOURCE_READ_TOKEN }}
           CI_RESULT_PUBLIC_KEY: ${{ secrets.CI_RESULT_PUBLIC_KEY }}
         run: node relay.mjs execute
 
@@ -65,5 +66,5 @@ jobs:
           TASK_GROUP: ${{ inputs.group }}
           CI_RELAY_KEY: ${{ secrets.CI_RELAY_KEY }}
           CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
-          CI_SOURCE_TOKEN: ${{ secrets.CI_SOURCE_TOKEN }}
+          CI_CALLBACK_TOKEN: ${{ secrets.CI_CALLBACK_TOKEN }}
         run: node relay.mjs callback

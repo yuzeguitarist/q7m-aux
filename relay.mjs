@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { lstat, mkdir, open, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { isolateMac } from './mac-runner.mjs';
 
 const MAX_PAYLOAD = 48 * 1024;
 const MAX_LOG = 8 * 1024 * 1024;
@@ -128,11 +129,12 @@ function taskFromEnvironment() {
   return task;
 }
 
-async function api(path, options = {}) {
+async function api(path, options = {}, token = process.env.CI_SOURCE_READ_TOKEN) {
+  if (!token) throw new Error('Scoped relay credential is not configured');
   const response = await fetch(`https://api.github.com/${path}`, {
     ...options,
     headers: {
-      Authorization: `Bearer ${process.env.CI_SOURCE_TOKEN}`,
+      Authorization: `Bearer ${token}`,
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
       ...options.headers,
@@ -180,24 +182,54 @@ export function childEnvironment(environment) {
 }
 
 export async function runScript(source, platform, scope, options = {}) {
-  const { kind = 'checks', parameters = {}, sha, metadataPath } = options;
+  const { kind = 'checks', parameters = {}, sha, metadataPath, trustedSiteScript } = options;
   validateParameters(parameters);
-  const script = join(source, kind === 'site' ? '.github/ci/site.sh' : '.github/ci/run.sh');
+  if (kind === 'site' && !trustedSiteScript) throw new Error('Site tasks require a trusted runner script');
+  const script = kind === 'site' ? trustedSiteScript : join(source, '.github/ci/run.sh');
   const canonicalSource = await realpath(source);
   const canonicalScript = await realpath(script);
-  if (!(await lstat(script)).isFile() || !canonicalScript.startsWith(canonicalSource + sep)) {
+  if (!(await lstat(script)).isFile()
+      || (kind !== 'site' && !canonicalScript.startsWith(canonicalSource + sep))) {
     throw new Error('Invalid script');
   }
+  const environment = { ...childEnvironment(process.env), ...parameters, CI_SCOPE: scope,
+    ...(kind === 'site' ? { CI_SOURCE_DIRECTORY: canonicalSource } : {}),
+    ...(sha ? { CI_SOURCE_SHA: sha } : {}),
+    ...(metadataPath ? { CI_RESULT_METADATA_PATH: metadataPath } : {}),
+  };
+  if (kind === 'site') return captureCommand('bash', [script, platform], source, environment);
+  if (platform === 'linux') {
+    const name = `cfci-${randomBytes(12).toString('hex')}`;
+    try {
+      return await captureCommand('docker', [
+        'run', '--rm', '--init', '--name', name, '--cap-drop=ALL', '--security-opt=no-new-privileges',
+        '--pids-limit=512', '--memory=6g', '--cpus=2',
+        '--mount', `type=bind,source=${canonicalSource},target=/workspace`, '--workdir', '/workspace',
+        '--env', 'CI=true', '--env', `CI_SCOPE=${scope}`,
+        ...Object.entries(parameters).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
+        'python:3.13-bookworm', 'bash', '.github/ci/run.sh', platform,
+      ], source, childEnvironment(process.env));
+    } finally {
+      await command('docker', ['rm', '-f', name], { env: childEnvironment(process.env) }).catch(() => {});
+    }
+  }
+  if (platform !== 'macos') throw new Error('Unsupported execution platform');
+  const isolated = await isolateMac(canonicalSource, childEnvironment(process.env));
+  try {
+    return await captureCommand('/usr/bin/sudo', [...isolated.args,
+      `CI_SCOPE=${scope}`, '/bin/bash', `${isolated.source}/.github/ci/run.sh`, platform,
+    ], '/', childEnvironment(process.env), isolated.stop);
+  } finally { await isolated.cleanup(); }
+}
+
+// Capturing and cancellation are tested independently of the OS isolation layer.
+export async function captureCommand(executable, args, cwd, environment, stop) {
   let logSize = 0;
   const chunks = [];
   let truncated = false;
   const exitCode = await new Promise(resolveRun => {
-    const child = spawn('bash', [script, platform], {
-      cwd: source, env: {
-        ...childEnvironment(process.env), ...parameters, CI_SCOPE: scope,
-        ...(sha ? { CI_SOURCE_SHA: sha } : {}),
-        ...(metadataPath ? { CI_RESULT_METADATA_PATH: metadataPath } : {}),
-      },
+    const child = spawn(executable, args, {
+      cwd, env: environment,
       detached: true, stdio: ['ignore', 'pipe', 'pipe'],
     });
     const keep = chunk => {
@@ -210,6 +242,7 @@ export async function runScript(source, platform, scope, options = {}) {
     let interruptedExitCode;
     const interrupt = exitCode => {
       interruptedExitCode ??= exitCode;
+      if (stop) void stop().catch(() => {});
       if (child.pid) {
         try { process.kill(-child.pid, 'SIGKILL'); } catch {}
       }
@@ -256,8 +289,19 @@ async function execute() {
     await downloadSource(task, archive);
     await command('tar', ['-xzf', archive, '--strip-components=1', '-C', source], { env: childEnvironment(process.env) });
     await rm(archive);
+    let trustedSiteScript;
+    if (task.kind === 'site') {
+      // Pull-request sources must not choose the host-side deployment program.
+      const response = await api(`repos/${task.repository}/contents/.github/ci/site.sh?ref=main`, {
+        headers: { Accept: 'application/vnd.github.raw+json' },
+      });
+      const script = await response.text();
+      if (Buffer.byteLength(script) > 64 * 1024) throw new Error('Site runner is too large');
+      trustedSiteScript = join(directory, 'trusted-site.sh');
+      await writeFile(trustedSiteScript, script, { mode: 0o600 });
+    }
     outcome = await runScript(source, task.platform, task.scope, {
-      kind: task.kind ?? 'checks', parameters: task.parameters, sha: task.sha, metadataPath,
+      kind: task.kind ?? 'checks', parameters: task.parameters, sha: task.sha, metadataPath, trustedSiteScript,
     });
     try {
       const metadata = await lstat(metadataPath);
@@ -291,7 +335,7 @@ export async function callback() {
       run_id: runId, run_attempt: attempt, id: task.id, request_run_id: task.request_run_id,
       request_run_attempt: task.request_run_attempt, kind: task.kind ?? 'checks', platform: task.platform,
     } }),
-  });
+  }, process.env.CI_CALLBACK_TOKEN);
 }
 
 function runFromEnvironment() {
