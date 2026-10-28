@@ -91,6 +91,17 @@ async function main() {
   const result = { platform, cases: [], passed: false };
   try {
     if (platform === 'macos') {
+      const accounts = await run('/usr/bin/dscl', ['.', '-list', '/Users', 'UniqueID']);
+      const used = new Set(accounts.trim().split('\n').map(line => Number(line.trim().split(/\s+/).at(-1))));
+      const uid = Array.from({ length: 1000 }, (_, index) => 65000 + index).find(value => !used.has(value));
+      assert.ok(uid, 'an unregistered high UID is required for the domain query control');
+      const firstLine = output => output?.split(/\r?\n/).find(line => line.trim())?.trim().slice(0, 200) ?? '(empty)';
+      const control = await execute('/usr/bin/sudo', ['-n', '/bin/launchctl', 'print', `user/${uid}`],
+        { timeout: 30_000, maxBuffer: 64 * 1024 })
+        .then(({ stdout }) => ({ uid, exitCode: 0, firstLine: firstLine(stdout) }))
+        .catch(error => ({ uid, exitCode: error.code, firstLine: firstLine(error.stdout || error.stderr) }));
+      result.unregisteredUserDomainControl = control;
+      console.log(`CONTROL macos unregistered UID: ${JSON.stringify(control)}`);
       config.hostKeychain = join(root, 'host.keychain-db');
       await run('/usr/bin/security', ['create-keychain', '-p', 'synthetic-password', config.hostKeychain]);
       await run('/usr/bin/security', ['unlock-keychain', '-p', 'synthetic-password', config.hostKeychain]);
