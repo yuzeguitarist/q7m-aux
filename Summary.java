@@ -29,10 +29,6 @@ public class Summary extends HeadlessScript {
     private static final int MAX_PATHS = 30;
     private static final int MAX_BFS_PATHS = 12;
     private static final int MAX_DEPTH = 10;
-    private static final String[] DECOMPILER_STYLES = {
-        "decompile", "normalize", "paramid", "register", "firstpass"
-    };
-
     private String outputPath;
     private String imageLabel;
     private String passMode;
@@ -54,8 +50,6 @@ public class Summary extends HeadlessScript {
     private final Map<String, Set<String>> anchorById = new HashMap<>();
     private final Set<String> unresolvedPatterns = new LinkedHashSet<>();
     private final Map<String, Double> scores = new HashMap<>();
-    private final Map<String, Map<String, Integer>> styleHashes = new HashMap<>();
-    private final Set<String> styleVariationFunctions = new HashSet<>();
     private final Set<String> attemptedFunctions = new HashSet<>();
     private final Set<String> decompiledFunctions = new HashSet<>();
     private final Set<String> nontrivialFunctions = new HashSet<>();
@@ -74,7 +68,6 @@ public class Summary extends HeadlessScript {
     private final Set<String> callStatsCounted = new HashSet<>();
     private int decompilationAttempts;
     private int decompilationFailures;
-    private int styleVariationCount;
 
     private static final class Candidate {
         final Function function;
@@ -147,6 +140,8 @@ public class Summary extends HeadlessScript {
         runWeightedRollouts(seeds);
 
         decompiler = new DecompInterface();
+        // Other analysis modes produce intermediate trees rather than valid C.
+        decompiler.setSimplificationStyle("decompile");
         decompiler.openProgram(currentProgram);
         try {
             runDecompilationPasses();
@@ -164,7 +159,6 @@ public class Summary extends HeadlessScript {
         explorationSummary.put("decompiled_function_count", decompiledFunctions.size());
         explorationSummary.put("decompilation_attempt_count", decompilationAttempts);
         explorationSummary.put("decompilation_failure_count", decompilationFailures);
-        explorationSummary.put("style_variation_count", styleVariationCount);
         explorationSummary.put("budget_reached", budgetReached);
         explorationSummary.put("auto_analysis_timed_out", autoAnalysisTimedOut);
 
@@ -206,7 +200,6 @@ public class Summary extends HeadlessScript {
         row.put("analysis_pass_count", analysisPasses);
         row.put("decompilation_attempt_count", decompilationAttempts);
         row.put("decompilation_failure_count", decompilationFailures);
-        row.put("style_variation_count", styleVariationCount);
         row.put("exploration", exploration);
         try (FileWriter writer = new FileWriter(outputPath)) {
             writer.write(toJson(row));
@@ -522,17 +515,14 @@ public class Summary extends HeadlessScript {
             if (scoreOrder != 0) return scoreOrder;
             return Long.compare(size(right), size(left));
         });
-        int styleCount = DECOMPILER_STYLES.length;
         long iteration = 0;
         while (withinBudget() && !ranked.isEmpty()) {
-            int functionIndex = (int) ((iteration / styleCount) % ranked.size());
-            String style = DECOMPILER_STYLES[(int) (iteration % styleCount)];
+            int functionIndex = (int) (iteration % ranked.size());
             Function function = ranked.get(functionIndex);
             String functionId = id(function);
             attemptedFunctions.add(functionId);
             decompilationAttempts++;
             try {
-                decompiler.setSimplificationStyle(style);
                 DecompileResults result = decompiler.decompileFunction(function, 6, monitor);
                 if (result != null && result.decompileCompleted() && result.getDecompiledFunction() != null) {
                     String c = result.getDecompiledFunction().getC();
@@ -550,11 +540,6 @@ public class Summary extends HeadlessScript {
                         try { callEdgesObserved += function.getCalledFunctions(monitor).size(); } catch (Throwable ignored) { }
                         try { callerEdgesObserved += function.getCallingFunctions(monitor).size(); } catch (Throwable ignored) { }
                     }
-                    String normalized = c.replaceAll("\\s+", "");
-                    int hash = normalized.hashCode();
-                    Map<String, Integer> hashes = styleHashes.computeIfAbsent(functionId, key -> new HashMap<>());
-                    if (!hashes.isEmpty() && !hashes.containsValue(hash) && styleVariationFunctions.add(functionId)) styleVariationCount++;
-                    hashes.put(style, hash);
                     Map<String, Object> node = nodes.get(functionId);
                     if (node != null) {
                         node.put("decompiled", true);
@@ -569,15 +554,15 @@ public class Summary extends HeadlessScript {
                 decompilationFailures++;
             }
             iteration++;
-            if (iteration > 0 && iteration % Math.max(1, ranked.size() * styleCount) == 0) analysisPasses++;
+            if (iteration > 0 && iteration % Math.max(1, ranked.size()) == 0) analysisPasses++;
             long now = System.currentTimeMillis();
             if (now - lastProgressLog >= 300000L) {
                 long elapsed = Math.max(0, (now - startedAt) / 1000L);
-                println("PATH_EXPLORER_PROGRESS image=" + imageLabel + " mode=" + passMode + " elapsed=" + elapsed + "s budget=" + budgetSeconds + "s functions=" + attemptedFunctions.size() + " decompiled=" + decompiledFunctions.size() + " paths=" + paths.size() + " style_variations=" + styleVariationCount);
+                println("PATH_EXPLORER_PROGRESS image=" + imageLabel + " mode=" + passMode + " elapsed=" + elapsed + "s budget=" + budgetSeconds + "s functions=" + attemptedFunctions.size() + " decompiled=" + decompiledFunctions.size() + " paths=" + paths.size());
                 lastProgressLog = now;
             }
         }
-        analysisPasses = Math.max(analysisPasses, (int) (iteration / Math.max(1, ranked.size() * styleCount)));
+        analysisPasses = Math.max(analysisPasses, (int) (iteration / Math.max(1, ranked.size())));
     }
 
     private double score(Function function) {

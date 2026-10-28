@@ -29,7 +29,7 @@ jobs:
     name: Execute
     if: github.actor == github.repository_owner && github.ref == 'refs/heads/main'
     environment: ci-relay
-    runs-on: ${{ inputs.platform == 'macos' && 'macos-26' || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.platform == 'macos' && 'xcode-27' || 'ubuntu-latest' }}
     timeout-minutes: 65
     steps:
       - name: Prepare
