@@ -202,8 +202,13 @@ public class Summary extends HeadlessScript {
         row.put("auto_analysis_timed_out", autoAnalysisTimedOut);
         byte[] autoAnalysisTiming = AutoAnalysisManager.getAnalysisManager(currentProgram)
             .getTaskTimesString().getBytes(StandardCharsets.UTF_8);
+        int autoAnalysisTimingLength = Math.min(autoAnalysisTiming.length, 8192);
+        while (autoAnalysisTimingLength < autoAnalysisTiming.length
+                && (autoAnalysisTiming[autoAnalysisTimingLength] & 0xc0) == 0x80) {
+            autoAnalysisTimingLength--;
+        }
         row.put("auto_analysis_timing", new String(autoAnalysisTiming, 0,
-            Math.min(autoAnalysisTiming.length, 8192), StandardCharsets.UTF_8));
+            autoAnalysisTimingLength, StandardCharsets.UTF_8));
         row.put("analysis_pass_count", analysisPasses);
         row.put("decompilation_attempt_count", decompilationAttempts);
         row.put("decompilation_failure_count", decompilationFailures);
