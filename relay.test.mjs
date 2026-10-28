@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomBytes } from 'node:crypto';
+import { execFileSync, spawn } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { buildReport, callback, childEnvironment, openResult, openTask, runScript, sealResult, sealTask, validateParameters, validateTask } from './relay.mjs';
@@ -133,3 +137,51 @@ test('binary-heavy oversized logs remain within encrypted report limits', async 
   const report = buildReport(task, outcome, { public_run_id: '1234', public_run_attempt: '1' });
   assert.deepEqual(openResult(sealResult(report, publicKey, key), privateKey, key), report);
 });
+
+for (const [signal, expectedCode] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+  test(`${signal} cancels the detached process group immediately`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'relay-cancel-'));
+    const marker = join(directory, 'ready');
+    const runner = spawn(process.execPath, [fileURLToPath(new URL('./fixtures/wait-runner.mjs', import.meta.url)), marker],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    let errors = '';
+    runner.stdout.on('data', chunk => { output += chunk; });
+    runner.stderr.on('data', chunk => { errors += chunk; });
+    const closed = new Promise((resolveClose, reject) => {
+      runner.on('error', reject);
+      runner.on('close', (code, receivedSignal) => resolveClose({ code, receivedSignal }));
+    });
+    const deadline = setTimeout(() => runner.kill('SIGKILL'), 5000);
+    let descendants = [];
+    try {
+      const readyDeadline = Date.now() + 3000;
+      while (!descendants.length && Date.now() < readyDeadline) {
+        try { descendants = (await readFile(marker, 'utf8')).trim().split(' ').map(Number); } catch {}
+        if (!descendants.length) await new Promise(resolveDelay => setTimeout(resolveDelay, 20));
+      }
+      assert.equal(descendants.length, 2, 'controlled descendant must start before cancellation');
+      const started = Date.now();
+      runner.kill(signal);
+      assert.deepEqual(await closed, { code: 0, receivedSignal: null });
+      assert.ok(Date.now() - started < 2000, 'cancellation must finish within two seconds');
+      assert.equal(errors, '');
+      const received = JSON.parse(output);
+      assert.equal(received.result.exit_code, expectedCode);
+      assert.equal(received.interruptListeners, 0);
+      assert.equal(received.terminateListeners, 0);
+      for (const pid of descendants) {
+        let status = '';
+        try { status = execFileSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch {}
+        assert.ok(!status || status.startsWith('Z'), `descendant ${pid} must no longer be running`);
+      }
+    } finally {
+      clearTimeout(deadline);
+      if (runner.exitCode === null && runner.signalCode === null) runner.kill('SIGKILL');
+      if (descendants[0]) {
+        try { process.kill(-descendants[0], 'SIGKILL'); } catch {}
+      }
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+}

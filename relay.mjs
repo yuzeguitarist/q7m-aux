@@ -207,14 +207,28 @@ export async function runScript(source, platform, scope, options = {}) {
     };
     child.stdout.on('data', keep);
     child.stderr.on('data', keep);
-    const timer = setTimeout(() => {
-      try { process.kill(-child.pid, 'SIGKILL'); } catch {}
-    }, 50 * 60 * 1000);
-    child.on('error', () => { clearTimeout(timer); resolveRun(127); });
-    child.on('close', (code, signal) => {
+    let interruptedExitCode;
+    const interrupt = exitCode => {
+      interruptedExitCode ??= exitCode;
+      if (child.pid) {
+        try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+      }
+    };
+    const onInterrupt = () => interrupt(130);
+    const onTerminate = () => interrupt(143);
+    process.on('SIGINT', onInterrupt);
+    process.on('SIGTERM', onTerminate);
+    const timer = setTimeout(() => interrupt(124), 50 * 60 * 1000);
+    const cleanup = () => {
       clearTimeout(timer);
+      process.removeListener('SIGINT', onInterrupt);
+      process.removeListener('SIGTERM', onTerminate);
+    };
+    child.on('error', () => { cleanup(); resolveRun(interruptedExitCode ?? 127); });
+    child.on('close', (code, signal) => {
+      cleanup();
       const signals = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGABRT: 6, SIGKILL: 9, SIGTERM: 15 };
-      resolveRun(code ?? (signal === 'SIGKILL' ? 124 : 128 + (signals[signal] ?? 0)));
+      resolveRun(interruptedExitCode ?? code ?? (signal === 'SIGKILL' ? 124 : 128 + (signals[signal] ?? 0)));
     });
   });
   let log = Buffer.concat(chunks).toString('utf8');
