@@ -46,16 +46,20 @@ async function collectWorker(configFile, mode, readyPath) {
   child.stderr.on('data', data => { errors += data; });
   const finished = new Promise((resolveExit, reject) => {
     child.on('error', reject);
-    child.on('close', code => code === 0 ? resolveExit() : reject(new Error(`worker exited ${code}; stderr bytes=${errors.length}`)));
+    child.on('close', code => code === 0 ? resolveExit() : reject(new Error(
+      `worker exited ${code}; ${errors.trim().replace(/[\r\n]+/g, ' ').slice(-600)}`)));
   });
   finished.catch(() => {}); // Readiness polling must still reach the cleanup path on early failure.
+  const diagnostic = outcome => outcome.log.split('\n').filter(line => /(?:Error|Exception|assertion failed)/.test(line))
+    .slice(-2).join(' ').slice(0, 600);
   if (mode === 'hold') {
     const deadline = Date.now() + 12 * 60_000;
     while (!await exists(readyPath)) {
       if (child.exitCode !== null || Date.now() > deadline) {
         child.kill('SIGTERM');
         await finished.catch(() => {});
-        throw new Error('fixture never reached cancellation checkpoint');
+        const outcome = output ? JSON.parse(output) : {};
+        throw new Error(`fixture never reached cancellation checkpoint; exit=${outcome.exit_code}; ${outcome.log ? diagnostic(outcome) : 'no fixture output'}`);
       }
       await new Promise(resolveWait => setTimeout(resolveWait, 200));
     }
@@ -63,7 +67,7 @@ async function collectWorker(configFile, mode, readyPath) {
   }
   await finished;
   const outcome = JSON.parse(output);
-  assert.equal(outcome.exit_code, { success: 0, failure: 17, hold: 143 }[mode]);
+  assert.equal(outcome.exit_code, { success: 0, failure: 17, hold: 143 }[mode], diagnostic(outcome));
   const line = outcome.log.split('\n').find(value => value.startsWith('SMOKE_JSON:'));
   assert.ok(line, 'fixture must finish its assertions before teardown');
   return JSON.parse(line.slice('SMOKE_JSON:'.length));

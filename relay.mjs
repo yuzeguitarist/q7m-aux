@@ -203,9 +203,10 @@ export async function runScript(source, platform, scope, options = {}) {
     try {
       return await captureCommand('docker', [
         'run', '--rm', '--init', '--name', name, '--cap-drop=ALL', '--security-opt=no-new-privileges',
+        '--user', `${process.getuid()}:${process.getgid()}`,
         '--pids-limit=512', '--memory=6g', '--cpus=2',
         '--mount', `type=bind,source=${canonicalSource},target=/workspace`, '--workdir', '/workspace',
-        '--env', 'CI=true', '--env', `CI_SCOPE=${scope}`,
+        '--env', 'HOME=/tmp', '--env', 'CI=true', '--env', `CI_SCOPE=${scope}`,
         ...Object.entries(parameters).flatMap(([key, value]) => ['--env', `${key}=${value}`]),
         'python:3.13-bookworm', 'bash', '.github/ci/run.sh', platform,
       ], source, childEnvironment(process.env));
