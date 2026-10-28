@@ -90,7 +90,7 @@ async function main() {
   assert.ok(parentEnvironment.includes(canary), 'same-UID positive control must see the synthetic parent canary');
   const root = await mkdtemp(join(tmpdir(), 'isolation-control-'));
   await chmod(root, 0o700);
-  const readyRoot = await mkdtemp(join(tmpdir(), 'isolation-ready-'));
+  const readyRoot = await mkdtemp(join(platform === 'macos' ? '/private/tmp' : tmpdir(), 'isolation-ready-'));
   await chmod(readyRoot, 0o733);
   const config = { hostUid: process.getuid(), hostHome: homedir(), hostCanary: join(root, 'host-canary') };
   await writeFile(config.hostCanary, 'synthetic-value-not-a-secret', { mode: 0o600 });
