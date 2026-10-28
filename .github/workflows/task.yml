@@ -1,0 +1,67 @@
+name: Task
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: Payload
+        required: true
+        type: string
+      platform:
+        description: Platform
+        required: true
+        type: choice
+        options: [linux, macos]
+      group:
+        description: Group
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: task-${{ inputs.group }}-${{ inputs.platform }}
+  cancel-in-progress: true
+
+jobs:
+  execute:
+    name: Execute
+    if: github.actor == github.repository_owner && github.ref == 'refs/heads/main'
+    runs-on: ${{ inputs.platform == 'macos' && 'macos-15' || 'ubuntu-latest' }}
+    timeout-minutes: 65
+    steps:
+      - name: Prepare
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Execute
+        env:
+          TASK_PAYLOAD: ${{ inputs.payload }}
+          TASK_PLATFORM: ${{ inputs.platform }}
+          TASK_GROUP: ${{ inputs.group }}
+          CI_RELAY_KEY: ${{ secrets.CI_RELAY_KEY }}
+          CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          CI_SOURCE_TOKEN: ${{ secrets.CI_SOURCE_TOKEN }}
+          CI_RESULT_PUBLIC_KEY: ${{ secrets.CI_RESULT_PUBLIC_KEY }}
+        run: node relay.mjs execute
+
+      - name: Store
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: payload
+          path: ${{ runner.temp }}/result/payload.bin
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Complete
+        env:
+          TASK_PAYLOAD: ${{ inputs.payload }}
+          TASK_PLATFORM: ${{ inputs.platform }}
+          TASK_GROUP: ${{ inputs.group }}
+          CI_RELAY_KEY: ${{ secrets.CI_RELAY_KEY }}
+          CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          CI_SOURCE_TOKEN: ${{ secrets.CI_SOURCE_TOKEN }}
+        run: node relay.mjs callback
