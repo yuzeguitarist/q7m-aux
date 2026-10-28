@@ -28,7 +28,7 @@ jobs:
   execute:
     name: Execute
     if: github.actor == github.repository_owner && github.ref == 'refs/heads/main'
-    runs-on: ${{ inputs.platform == 'macos' && 'macos-15' || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.platform == 'macos' && 'macos-26' || 'ubuntu-latest' }}
     timeout-minutes: 65
     steps:
       - name: Prepare
