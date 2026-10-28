@@ -1,0 +1,14 @@
+.github/workflows/task.yml
+  h_cf34f0def99ee0 61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "be6821c7e1a0eb1d534c3b618c277661be3a64a0",
+  "prompts": {},
+  "humans": {
+    "h_cf34f0def99ee0": {
+      "author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
