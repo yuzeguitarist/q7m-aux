@@ -1,0 +1,39 @@
+name: Isolation smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  boundary:
+    if: github.actor == github.repository_owner && github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      ISOLATION_SMOKE_PARENT_CANARY: synthetic-public-fixture-not-a-secret
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            relay.mjs
+            mac-runner.mjs
+            smoke
+          sparse-checkout-cone-mode: false
+      - name: Exercise generic fixtures
+        run: node smoke/isolation-smoke.mjs "$GITHUB_WORKSPACE"
+      - name: Store sanitized assertions
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: isolation-${{ runner.os }}
+          path: ${{ runner.temp }}/isolation-smoke-result.json
+          retention-days: 1
+          if-no-files-found: warn
+
