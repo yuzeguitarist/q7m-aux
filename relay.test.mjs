@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomBytes } from 'node:crypto';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { buildReport, childEnvironment, openResult, openTask, runScript, sealResult, sealTask, validateParameters, validateTask } from './relay.mjs';
+import { buildReport, callback, childEnvironment, openResult, openTask, runScript, sealResult, sealTask, validateParameters, validateTask } from './relay.mjs';
 
 const key = randomBytes(32).toString('base64');
 const otherKey = randomBytes(32).toString('base64');
@@ -12,7 +12,7 @@ const { publicKey, privateKey } = generateKeyPairSync('rsa', {
   privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
 });
 const task = { version: 1, id: 'a'.repeat(32), group: 'd'.repeat(64), repository: 'owner/source', sha: 'b'.repeat(40),
-  status_sha: 'c'.repeat(40), platform: 'linux', scope: 'app', request_run_id: '123', context: 'CI / Linux' };
+  status_sha: 'c'.repeat(40), platform: 'linux', scope: 'app', request_run_id: '123', request_run_attempt: '1', context: 'CI / Linux' };
 
 test('task encryption hides metadata and authenticates it', () => {
   const payload = sealTask(task, key);
@@ -42,6 +42,7 @@ test('task validation binds repository, platform, commit and request', () => {
   for (const change of [
     { version: 2 }, { id: '../bad' }, { group: 'invalid' }, { sha: 'main' }, { status_sha: 'main' }, { repository: 'elsewhere/source' },
     { platform: 'macos' }, { scope: 'arbitrary' }, { request_run_id: '1; echo bad' }, { context: '\n::error::bad' },
+    { request_run_attempt: undefined }, { request_run_attempt: '0' }, { request_run_attempt: '1000000' },
   ]) assert.throws(() => validateTask({ ...task, ...change }, 'owner/source', 'linux'));
   assert.throws(() => openTask('a'.repeat(50_000), key));
 });
@@ -63,10 +64,42 @@ test('reports omit secret parameters and retain metadata inside encryption', () 
   const report = buildReport(enriched, { exit_code: 0, log: 'complete', outputs: { url: 'https://example.test/preview' } },
     { public_run_id: '1234', public_run_attempt: '1' });
   assert.equal('parameters' in report, false);
+  assert.equal(report.request_run_attempt, '1');
   assert.equal(JSON.stringify(report).includes('top-secret-parameter'), false);
   const encrypted = sealResult(report, publicKey, key);
   assert.equal(encrypted.includes(Buffer.from('example.test')), false);
   assert.deepEqual(openResult(encrypted, privateKey, key), report);
+});
+
+test('callback binds the private request attempt and task kind', async () => {
+  const enriched = { ...task, kind: 'site', request_run_attempt: '2' };
+  const values = {
+    TASK_PAYLOAD: sealTask(enriched, key), CI_RELAY_KEY: key,
+    CI_SOURCE_REPOSITORY: task.repository, TASK_PLATFORM: task.platform, TASK_GROUP: task.group,
+    GITHUB_RUN_ID: '456', GITHUB_RUN_ATTEMPT: '3', CI_SOURCE_TOKEN: 'test-token',
+  };
+  const prior = Object.fromEntries(Object.keys(values).map(name => [name, process.env[name]]));
+  const originalFetch = globalThis.fetch;
+  let request;
+  Object.assign(process.env, values);
+  globalThis.fetch = async (url, options) => {
+    request = { url, body: JSON.parse(options.body) };
+    return new Response(null, { status: 204 });
+  };
+  try {
+    await callback();
+    assert.equal(request.url, `https://api.github.com/repos/${task.repository}/dispatches`);
+    assert.deepEqual(request.body, { event_type: 'ci-relay-result', client_payload: {
+      run_id: '456', run_attempt: '3', id: task.id, request_run_id: '123',
+      request_run_attempt: '2', kind: 'site', platform: 'linux',
+    } });
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const [name, value] of Object.entries(prior)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 });
 
 test('child processes receive no relay or Actions credentials', () => {

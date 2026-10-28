@@ -89,6 +89,7 @@ export function validateTask(task, repository, platform) {
       || !['checks', 'site'].includes(task.kind ?? 'checks')
       || (task.kind === 'site' && platform !== 'linux')
       || !/^[1-9][0-9]{0,19}$/.test(task.request_run_id ?? '')
+      || !/^[1-9][0-9]{0,5}$/.test(task.request_run_attempt ?? '')
       || typeof task.context !== 'string' || !/^[A-Za-z0-9 /_.-]{1,100}$/.test(task.context)) {
     throw new Error('Invalid task');
   }
@@ -113,7 +114,8 @@ export function buildReport(task, outcome, publicRun) {
   return {
     version: task.version, id: task.id, group: task.group, repository: task.repository, sha: task.sha,
     status_sha: task.status_sha, platform: task.platform, scope: task.scope,
-    kind: task.kind ?? 'checks', request_run_id: task.request_run_id, context: task.context,
+    kind: task.kind ?? 'checks', request_run_id: task.request_run_id,
+    request_run_attempt: task.request_run_attempt, context: task.context,
     exit_code: outcome.exit_code, log: outcome.log, outputs: outcome.outputs ?? {},
     public_run_id: publicRun.public_run_id, public_run_attempt: publicRun.public_run_attempt,
   };
@@ -266,13 +268,14 @@ async function execute() {
   await rm(directory, { recursive: true, force: true });
 }
 
-async function callback() {
+export async function callback() {
   const task = taskFromEnvironment();
   const { public_run_id: runId, public_run_attempt: attempt } = runFromEnvironment();
   await api(`repos/${task.repository}/dispatches`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ event_type: 'ci-relay-result', client_payload: {
-      run_id: runId, run_attempt: attempt, id: task.id, request_run_id: task.request_run_id, platform: task.platform,
+      run_id: runId, run_attempt: attempt, id: task.id, request_run_id: task.request_run_id,
+      request_run_attempt: task.request_run_attempt, kind: task.kind ?? 'checks', platform: task.platform,
     } }),
   });
 }
