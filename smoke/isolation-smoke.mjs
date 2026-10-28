@@ -123,8 +123,13 @@ async function main() {
         assert.notEqual(observed.uid, config.hostUid);
         assert.equal(await exists(observed.home), false, 'isolated home must be deleted');
         const account = observed.home.split('/').at(-1);
-        await assert.rejects(run('/usr/bin/dscl', ['.', '-read', `/Users/${account}`]));
-        await assert.rejects(run('/usr/bin/sudo', ['-n', '/bin/launchctl', 'print', `user/${observed.uid}`]));
+        const firstLine = output => output?.split(/\r?\n/).find(line => line.trim())?.trim().slice(0, 200) ?? '(empty)';
+        const accountOutput = await run('/usr/bin/dscl', ['.', '-read', `/Users/${account}`]).catch(() => null);
+        assert.ok(accountOutput === null,
+          `isolated Directory Services account still exists after cleanup; first output: ${firstLine(accountOutput)}`);
+        const domainOutput = await run('/usr/bin/sudo', ['-n', '/bin/launchctl', 'print', `user/${observed.uid}`]).catch(() => null);
+        assert.ok(domainOutput === null,
+          `isolated launchd user domain still exists after cleanup; first output: ${firstLine(domainOutput)}`);
         assert.equal((await run('/bin/ps', ['-axo', 'uid='])).trim().split(/\s+/).includes(String(observed.uid)), false,
           'no process may survive under the isolated UID');
         if (observed.simulator) {
