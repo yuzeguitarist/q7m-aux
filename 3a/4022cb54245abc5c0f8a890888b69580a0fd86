@@ -1,0 +1,21 @@
+smoke/fixture-probe.py
+  s_58188b792fe08a::t_d57d409a539a63 63
+smoke/isolation-smoke.mjs
+  s_58188b792fe08a::t_ed95f67c6539bf 3,33,39,41-66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3a4022cb54245abc5c0f8a890888b69580a0fd86",
+  "prompts": {},
+  "sessions": {
+    "s_58188b792fe08a": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "07824b7a-32d3-439d-ac81-918805e50f09",
+        "model": "cursor-grok-4.6-xhigh"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
