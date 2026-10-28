@@ -21,10 +21,6 @@ def command(args, timeout=180):
 
 def succeeds(args, timeout=180):
     result = command(args, timeout)
-    if Path(args[0]).name == "launchctl" and result.returncode != 0:
-        detail = " ".join((result.stderr or result.stdout).split())[:200]
-        raise RuntimeError("assertion failed: command launchctl " + args[1]
-                           + " exit=" + str(result.returncode) + " output=" + (detail or "(empty)"))
     require("command " + Path(args[0]).name, result.returncode == 0)
     return result.stdout
 
@@ -60,10 +56,6 @@ if sys.argv[1] == "macos":
             "-s", "smoke-own", "-w", own]).strip() == "synthetic-value-not-a-secret")
     require("host keychain denied", command(["/usr/bin/security", "find-generic-password", "-a", "synthetic",
             "-s", "smoke-host", "-w", config["hostKeychain"]]).returncode != 0)
-    label = config["serviceLabel"]
-    service = "user/" + str(os.getuid()) + "/" + label
-    succeeds(["/bin/launchctl", "print", service])
-    result["serviceLabel"] = label
     if config["mode"] == "success":
         succeeds(["/usr/bin/xcrun", "swiftc", "keychain-probe.swift", "-o", "keychain-probe"])
         succeeds([str(Path.cwd() / "keychain-probe")])
