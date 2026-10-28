@@ -1,5 +1,6 @@
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.app.util.headless.HeadlessScript;
 import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.DataIterator;
@@ -8,6 +9,7 @@ import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
 import java.io.FileWriter;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -96,6 +98,7 @@ public class Summary extends HeadlessScript {
         budgetSeconds = Math.max(60, Integer.parseInt(args[2]));
         passMode = args[3];
         boolean autoAnalysisTimedOut = analysisTimeoutOccurred();
+        println("AUTO_ANALYSIS_RESULT timed_out=" + autoAnalysisTimedOut);
         parseAnalysisArgs(args);
 
         startedAt = System.currentTimeMillis();
@@ -197,6 +200,15 @@ public class Summary extends HeadlessScript {
         row.put("analysis_elapsed_seconds", elapsedSeconds);
         row.put("analysis_budget_reached", budgetReached);
         row.put("auto_analysis_timed_out", autoAnalysisTimedOut);
+        byte[] autoAnalysisTiming = AutoAnalysisManager.getAnalysisManager(currentProgram)
+            .getTaskTimesString().getBytes(StandardCharsets.UTF_8);
+        int autoAnalysisTimingLength = Math.min(autoAnalysisTiming.length, 8192);
+        while (autoAnalysisTimingLength < autoAnalysisTiming.length
+                && (autoAnalysisTiming[autoAnalysisTimingLength] & 0xc0) == 0x80) {
+            autoAnalysisTimingLength--;
+        }
+        row.put("auto_analysis_timing", new String(autoAnalysisTiming, 0,
+            autoAnalysisTimingLength, StandardCharsets.UTF_8));
         row.put("analysis_pass_count", analysisPasses);
         row.put("decompilation_attempt_count", decompilationAttempts);
         row.put("decompilation_failure_count", decompilationFailures);

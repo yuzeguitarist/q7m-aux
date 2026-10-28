@@ -266,7 +266,7 @@ function cleanLogLine(value) {
     .slice(0, 480);
 }
 
-async function runStreaming(argv, options = {}) {
+export async function runStreaming(argv, options = {}) {
   const phase = options.phase || "analysis";
   const progressValue = options.progress ?? 60;
   const statusValue = options.status || "analyzing";
@@ -281,8 +281,26 @@ async function runStreaming(argv, options = {}) {
   const child = spawn(argv[0], argv.slice(1), {
     cwd: options.cwd || process.cwd(),
     env: childEnvironment(),
+    detached: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  let timedOut = false;
+  let interruptedSignal;
+  let forceKill;
+  const killGroup = signal => {
+    if (child.pid) {
+      try { process.kill(-child.pid, signal); } catch {}
+    }
+  };
+  const stop = () => {
+    if (forceKill) return;
+    killGroup("SIGTERM");
+    forceKill = setTimeout(() => killGroup("SIGKILL"), 5000);
+  };
+  const onInterrupt = () => { interruptedSignal ??= "SIGINT"; stop(); };
+  const onTerminate = () => { interruptedSignal ??= "SIGTERM"; stop(); };
+  process.on("SIGINT", onInterrupt);
+  process.on("SIGTERM", onTerminate);
   let lastEventAt = 0;
   let lineEventWindowStartedAt = Date.now();
   let lineEventCount = 0;
@@ -306,7 +324,8 @@ async function runStreaming(argv, options = {}) {
     }
     const important = /error|fatal|warn|fail|exception|complete|decompil|analysis|import|processing|program|function|path_explorer|budget|xcode cloud action/i.test(safe);
     if (!important) return;
-    const highPriority = /\b(error|fatal|fail\w*|exception|timeout|timed out)\b/i.test(safe);
+    const highPriority = /\bAUTO_ANALYSIS_RESULT timed_out=(true|false)\b/.test(safe)
+      || /\b(error|fatal|fail\w*|exception|timeout|timed out)\b/i.test(safe);
     if (highPriority) {
       if (highPriorityEventCount >= maxHighPriorityEventsPerWindow) return;
       highPriorityEventCount++;
@@ -322,7 +341,7 @@ async function runStreaming(argv, options = {}) {
     if (name === "stdout" && captureStdout) {
       if (stdoutBytes + chunk.length > maxCaptureBytes) {
         captureOverflow = true;
-        child.kill("SIGTERM");
+        stop();
       } else {
         stdoutChunks.push(Buffer.from(chunk));
         stdoutBytes += chunk.length;
@@ -360,12 +379,9 @@ async function runStreaming(argv, options = {}) {
     void studioLog(phase, "Still running: " + name + ".", progressValue, statusValue);
   }, 15000);
 
-  let timedOut = false;
-  let forceKill;
   const timer = setTimeout(() => {
     timedOut = true;
-    child.kill("SIGTERM");
-    forceKill = setTimeout(() => child.kill("SIGKILL"), 5000);
+    stop();
   }, timeoutMs);
 
   const outcome = await new Promise(resolvePromise => {
@@ -376,6 +392,9 @@ async function runStreaming(argv, options = {}) {
   clearTimeout(timer);
   clearTimeout(forceKill);
   clearInterval(heartbeat);
+  process.removeListener("SIGINT", onInterrupt);
+  process.removeListener("SIGTERM", onTerminate);
+  if (timedOut || captureOverflow || interruptedSignal) killGroup("SIGKILL");
   for (const name of ["stdout", "stderr"]) {
     if (!(name === "stdout" && captureStdout) && buffers[name]) emitLine(buffers[name]);
   }
@@ -383,6 +402,11 @@ async function runStreaming(argv, options = {}) {
     logStream.once("error", rejectPromise);
     logStream.end(resolvePromise);
   });
+  if (interruptedSignal) {
+    const error = new Error("analysis process interrupted (" + interruptedSignal + ")");
+    error.code = "ANALYSIS_INTERRUPTED";
+    throw error;
+  }
   if (timedOut) throw new Error("analysis process timeout");
   if (captureOverflow) throw new Error("analysis output size limit exceeded");
   if (outcome.error) throw outcome.error;
@@ -677,8 +701,7 @@ export function analysisWindow(deadline, now, remainingAnalysisMs, remainingImag
   // Automatic analysis precedes the active exploration budget. Reserve both,
   // plus process startup/teardown and time to deliver the encrypted report.
   const preparationMs = deadline - now - remainingAnalysisMs - 15 * 60 * 1000;
-  const autoAnalysisSeconds = Math.min(30 * 60,
-    Math.floor(preparationMs / remainingImages / 1000) - 60);
+  const autoAnalysisSeconds = Math.floor(preparationMs / remainingImages / 1000) - 60;
   if (autoAnalysisSeconds < 60) throw new Error("insufficient analysis preparation time");
   return { activeSeconds, autoAnalysisSeconds,
     timeoutMs: (activeSeconds + autoAnalysisSeconds + 60) * 1000 };
@@ -1197,6 +1220,7 @@ async function main() {
           logPath
         });
       } catch (error) {
+        if (error?.code === "ANALYSIS_INTERRUPTED") throw error;
         processErrorCode = error instanceof Error && error.message.includes("timeout") ? "process_timeout" : "process_error";
       }
 
