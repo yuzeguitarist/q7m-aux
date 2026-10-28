@@ -11,6 +11,13 @@ const here = dirname(fileURLToPath(import.meta.url));
 const canary = 'ISOLATION_SMOKE_PARENT_CANARY=synthetic-public-fixture-not-a-secret';
 const exists = path => access(path).then(() => true, () => false);
 const run = async (file, args) => (await execute(file, args, { timeout: 240_000, maxBuffer: 2 * 1024 * 1024 })).stdout;
+const domainDiagnostic = async (action, uid) => {
+  const firstLine = output => output?.split(/\r?\n/).find(line => line.trim())?.trim().slice(0, 200) ?? '(empty)';
+  return execute('/usr/bin/sudo', ['-n', '/bin/launchctl', action, `user/${uid}`],
+    { timeout: 30_000, maxBuffer: 64 * 1024 })
+    .then(({ stdout }) => ({ action, uid, exitCode: 0, firstLine: firstLine(stdout) }))
+    .catch(error => ({ action, uid, exitCode: error.code, firstLine: firstLine(error.stdout || error.stderr) }));
+};
 const platform = process.platform === 'darwin' ? 'macos' : 'linux';
 const moduleRoot = resolve(process.argv[2] ?? '.');
 
@@ -91,6 +98,13 @@ async function main() {
   const result = { platform, cases: [], passed: false };
   try {
     if (platform === 'macos') {
+      const accounts = await run('/usr/bin/dscl', ['.', '-list', '/Users', 'UniqueID']);
+      const used = new Set(accounts.trim().split('\n').map(line => Number(line.trim().split(/\s+/).at(-1))));
+      const uid = Array.from({ length: 1000 }, (_, index) => 65000 + index).find(value => !used.has(value));
+      assert.ok(uid, 'an unregistered high UID is required for the domain query control');
+      const control = await domainDiagnostic('print', uid);
+      result.unregisteredUserDomainControl = control;
+      console.log(`CONTROL macos unregistered UID: ${JSON.stringify(control)}`);
       config.hostKeychain = join(root, 'host.keychain-db');
       await run('/usr/bin/security', ['create-keychain', '-p', 'synthetic-password', config.hostKeychain]);
       await run('/usr/bin/security', ['unlock-keychain', '-p', 'synthetic-password', config.hostKeychain]);
@@ -128,6 +142,14 @@ async function main() {
         assert.ok(accountOutput === null,
           `isolated Directory Services account still exists after cleanup; first output: ${firstLine(accountOutput)}`);
         const domainOutput = await run('/usr/bin/sudo', ['-n', '/bin/launchctl', 'print', `user/${observed.uid}`]).catch(() => null);
+        if (domainOutput !== null) {
+          const bootout = await domainDiagnostic('bootout', observed.uid);
+          const reprint = await domainDiagnostic('print', observed.uid);
+          const hasProcesses = (await run('/bin/ps', ['-axo', 'uid='])).trim().split(/\s+/).includes(String(observed.uid));
+          result.userDomainCleanupDiagnostic = { bootout, reprint, hasProcesses };
+          console.log(`DIAGNOSTIC macos cleanup: ${JSON.stringify(result.userDomainCleanupDiagnostic)}`);
+          assert.equal(hasProcesses, false, 'no process may survive under the isolated UID');
+        }
         assert.ok(domainOutput === null,
           `isolated launchd user domain still exists after cleanup; first output: ${firstLine(domainOutput)}`);
         assert.equal((await run('/bin/ps', ['-axo', 'uid='])).trim().split(/\s+/).includes(String(observed.uid)), false,
