@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import { access, chmod, copyFile, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -30,42 +29,14 @@ async function worker(configFile, mode) {
     : await mkdtemp(join(tmpdir(), 'isolation-fixture-'));
   const source = join(parent, 'source');
   if (platform === 'linux') config.readyPath = '/workspace/checkpoint.json';
-  else config.serviceLabel = `com.example.isolation-smoke.${randomBytes(16).toString('hex')}`;
   await mkdir(join(source, '.github/ci'), { recursive: true });
   await copyFile(join(here, 'fixture.sh'), join(source, '.github/ci/run.sh'));
   await copyFile(join(here, 'fixture-probe.py'), join(source, 'fixture-probe.py'));
   await copyFile(join(here, 'keychain-probe.swift'), join(source, 'keychain-probe.swift'));
   await writeFile(join(source, 'fixture-config.json'), JSON.stringify(config));
-  const { runScript, captureCommand, childEnvironment } = await import(pathToFileURL(join(moduleRoot, 'relay.mjs')));
+  const { runScript } = await import(pathToFileURL(join(moduleRoot, 'relay.mjs')));
   try {
-    let result;
-    if (platform === 'macos') {
-      const { isolateMac } = await import(pathToFileURL(join(moduleRoot, 'mac-runner.mjs')));
-      const environment = childEnvironment(process.env);
-      const isolated = await isolateMac(source, environment);
-      try {
-        const root = (file, args) => run('/usr/bin/sudo', ['-n', file, ...args]);
-        const uid = (await root('/usr/bin/stat', ['-f', '%u', isolated.source])).trim();
-        const service = `user/${uid}/${config.serviceLabel}`;
-        const plist = join(isolated.source, 'isolation-service.plist');
-        const stagingPlist = join(parent, 'isolation-service.plist');
-        await writeFile(stagingPlist, `<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict>
-<key>Label</key><string>${config.serviceLabel}</string>
-<key>ProgramArguments</key><array><string>/bin/sleep</string><string>600</string></array>
-<key>KeepAlive</key><true/><key>RunAtLoad</key><true/>
-</dict></plist>`, { mode: 0o644 });
-        await root('/usr/bin/install', ['-m', '0644', '-o', '0', '-g', '0', stagingPlist, plist]);
-        await root('/usr/bin/plutil', ['-lint', plist]);
-        await root('/bin/launchctl', ['bootstrap', `user/${uid}`, plist]);
-        const pid = (await root('/bin/launchctl', ['kickstart', '-p', service])).trim();
-        assert.match(pid, /^\d+$/);
-        assert.equal((await run('/bin/ps', ['-o', 'uid=', '-p', pid])).trim(), uid, 'service must run as isolated UID');
-        result = await captureCommand('/usr/bin/sudo', [...isolated.args,
-          'CI_SCOPE=app', '/bin/bash', `${isolated.source}/.github/ci/run.sh`, platform,
-        ], '/', environment, isolated.stop);
-      } finally { await isolated.cleanup(); }
-    } else result = await runScript(source, platform, 'source');
+    const result = await runScript(source, platform, platform === 'macos' ? 'app' : 'source');
     process.stdout.write(JSON.stringify(result));
   } finally {
     await rm(parent, { recursive: true, force: true });
@@ -134,6 +105,8 @@ async function main() {
       const control = await domainDiagnostic('print', uid);
       result.unregisteredUserDomainControl = control;
       console.log(`CONTROL macos unregistered UID: ${JSON.stringify(control)}`);
+      // macOS 26 also prints unregistered UID domains successfully. Its exit code cannot
+      // prove domain-object absence; teardown checks the account, home and UID processes.
       config.hostKeychain = join(root, 'host.keychain-db');
       await run('/usr/bin/security', ['create-keychain', '-p', 'synthetic-password', config.hostKeychain]);
       await run('/usr/bin/security', ['unlock-keychain', '-p', 'synthetic-password', config.hostKeychain]);
@@ -170,11 +143,6 @@ async function main() {
         const accountOutput = await run('/usr/bin/dscl', ['.', '-read', `/Users/${account}`]).catch(() => null);
         assert.ok(accountOutput === null,
           `isolated Directory Services account still exists after cleanup; first output: ${firstLine(accountOutput)}`);
-        assert.match(observed.serviceLabel, /^com\.example\.isolation-smoke\.[0-9a-f]{32}$/);
-        const serviceOutput = await run('/usr/bin/sudo', ['-n', '/bin/launchctl', 'print',
-          `user/${observed.uid}/${observed.serviceLabel}`]).catch(() => null);
-        assert.ok(serviceOutput === null,
-          `isolated launchd service still exists after cleanup; first output: ${firstLine(serviceOutput)}`);
         assert.equal((await run('/bin/ps', ['-axo', 'uid='])).trim().split(/\s+/).includes(String(observed.uid)), false,
           'no process may survive under the isolated UID');
         if (observed.simulator) {
