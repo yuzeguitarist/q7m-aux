@@ -1,0 +1,30 @@
+.github/workflows/task.yml
+  h_cf34f0def99ee0 32
+Summary.java
+  h_cf34f0def99ee0 33-34,667
+audit.py
+  h_cf34f0def99ee0 122,131
+fixtures/wait-runner.mjs
+  h_cf34f0def99ee0 2,4-6
+mac-runner.mjs
+  h_cf34f0def99ee0 49
+relay.test.mjs
+  h_cf34f0def99ee0 9,83,120-122,134-136
+runner.mjs
+  h_cf34f0def99ee0 8-10,17,72-73,596,609-614,616-617,674-704,1032-1035,1177-1185,1197,1201,1216-1218,1259-1264,1285-1287
+runner.test.mjs
+  h_cf34f0def99ee0 1-141
+test_audit.py
+  h_cf34f0def99ee0 1-52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8f2e6501031f53673d2741a8d1c77660f445530e",
+  "prompts": {},
+  "humans": {
+    "h_cf34f0def99ee0": {
+      "author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
