@@ -220,6 +220,10 @@ export async function runScript(source, platform, scope, options = {}) {
     log = Buffer.from(log).subarray(0, MAX_LOG).toString('utf8');
     truncated = true;
   }
+  while (Buffer.byteLength(JSON.stringify(log)) > MAX_LOG) {
+    log = log.slice(0, Math.max(0, Math.floor(log.length * MAX_LOG / Buffer.byteLength(JSON.stringify(log))) - 128));
+    truncated = true;
+  }
   return { exit_code: exitCode, log: log + (truncated ? '\n[Log truncated at 8 MiB]\n' : '') };
 }
 

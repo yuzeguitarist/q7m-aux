@@ -90,3 +90,13 @@ test('execution captures raw workflow commands privately and propagates failures
     delete process.env.CI_RELAY_KEY;
   }
 });
+
+test('binary-heavy oversized logs remain within encrypted report limits', async () => {
+  const outcome = await runScript(fileURLToPath(new URL('./fixtures/source', import.meta.url)), 'linux', 'source',
+    { parameters: { LARGE_OUTPUT: '1' } });
+  assert.equal(outcome.exit_code, 0);
+  assert.match(outcome.log, /Log truncated/);
+  assert.ok(Buffer.byteLength(outcome.log) < 8 * 1024 * 1024 + 1024);
+  const report = buildReport(task, outcome, { public_run_id: '1234', public_run_attempt: '1' });
+  assert.deepEqual(openResult(sealResult(report, publicKey, key), privateKey, key), report);
+});
