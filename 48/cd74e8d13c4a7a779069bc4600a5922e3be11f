@@ -1,0 +1,18 @@
+Summary.java
+  h_cf34f0def99ee0 3,12,101,203-206
+runner.mjs
+  h_cf34f0def99ee0 269,284,287-303,327-328,344,384,395-397,405-409,704,1223
+runner.test.mjs
+  h_cf34f0def99ee0 5,11,22-23,35-36,46-55,166-283
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "48cd74e8d13c4a7a779069bc4600a5922e3be11f",
+  "prompts": {},
+  "humans": {
+    "h_cf34f0def99ee0": {
+      "author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
