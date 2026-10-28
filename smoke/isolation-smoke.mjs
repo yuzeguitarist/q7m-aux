@@ -47,14 +47,16 @@ async function worker(configFile, mode) {
         const root = (file, args) => run('/usr/bin/sudo', ['-n', file, ...args]);
         const uid = (await root('/usr/bin/stat', ['-f', '%u', isolated.source])).trim();
         const service = `user/${uid}/${config.serviceLabel}`;
-        const plist = join(parent, 'isolation-service.plist');
-        await writeFile(plist, `<?xml version="1.0" encoding="UTF-8"?>
+        const plist = join(isolated.source, 'isolation-service.plist');
+        const stagingPlist = join(parent, 'isolation-service.plist');
+        await writeFile(stagingPlist, `<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
 <key>Label</key><string>${config.serviceLabel}</string>
 <key>ProgramArguments</key><array><string>/bin/sleep</string><string>600</string></array>
 <key>KeepAlive</key><true/><key>RunAtLoad</key><true/>
-</dict></plist>`, { mode: 0o600 });
-        await root('/usr/sbin/chown', ['0:0', plist]);
+</dict></plist>`, { mode: 0o644 });
+        await root('/usr/bin/install', ['-m', '0644', '-o', '0', '-g', '0', stagingPlist, plist]);
+        await root('/usr/bin/plutil', ['-lint', plist]);
         await root('/bin/launchctl', ['bootstrap', `user/${uid}`, plist]);
         const pid = (await root('/bin/launchctl', ['kickstart', '-p', service])).trim();
         assert.match(pid, /^\d+$/);
