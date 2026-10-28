@@ -49,6 +49,17 @@ test("slow preparation cannot consume reserved active analysis", () => {
   assert.equal(lateWindow.activeSeconds, 3600);
 });
 
+test("a missing report cannot turn preparation wall time into active exploration", () => {
+  const result = analysisResult(null, 1, "process_timeout", "image-0");
+  const partial = mergeExplorations([result], 10800);
+  assert.equal(partial.elapsed_seconds, 0);
+  assert.equal(partial.budget_reached, false);
+  const early = analysisWindow(deadline, 20 * minute, 180 * minute, 3, 3600);
+  const late = analysisWindow(deadline, 150 * minute, 180 * minute, 3, 3600);
+  assert.equal(late.activeSeconds, early.activeSeconds);
+  assert.ok(late.autoAnalysisSeconds < early.autoAnalysisSeconds);
+});
+
 function completedRow(image = "image-0", seconds = 3600) {
   return {
     image, analysis_budget_reached: true, auto_analysis_timed_out: false,
@@ -87,7 +98,7 @@ test("partial, invalid and terminated reports remain failures", () => {
 });
 
 test("archive download backpressure does not accumulate error listeners", async () => {
-  await mkdir(join(directory, "q7m"));
+  await mkdir(join(directory, "q7m"), { recursive: true });
   const originalFetch = globalThis.fetch;
   const warnings = [];
   const onWarning = warning => warnings.push(warning);
@@ -115,6 +126,7 @@ test("archive download backpressure does not accumulate error listeners", async 
 });
 
 test("failed and empty archive streams are removed", async () => {
+  await mkdir(join(directory, "q7m"), { recursive: true });
   const originalFetch = globalThis.fetch;
   try {
     for (const failed of [false, true]) {

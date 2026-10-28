@@ -712,7 +712,6 @@ export function mergeExplorations(ghidraRows, budgetSeconds) {
   let imageCount = 0;
   let decompilationAttempts = 0;
   let decompilationFailures = 0;
-  let styleVariations = 0;
   let totalVisitedFunctions = 0;
 
   for (const row of ghidraRows.filter(Boolean)) {
@@ -723,7 +722,6 @@ export function mergeExplorations(ghidraRows, budgetSeconds) {
     analysisPasses += Math.max(0, Number(exploration.analysis_passes) || 0);
     decompilationAttempts += Math.max(0, Number(exploration.summary?.decompilation_attempt_count) || 0);
     decompilationFailures += Math.max(0, Number(exploration.summary?.decompilation_failure_count) || 0);
-    styleVariations += Math.max(0, Number(exploration.summary?.style_variation_count) || 0);
     totalVisitedFunctions += Math.max(0, Number(exploration.summary?.visited_function_count) || (Array.isArray(exploration.nodes) ? exploration.nodes.length : 0));
     const image = String(row.image || "unknown-image");
     const imageNodes = [];
@@ -836,7 +834,6 @@ export function mergeExplorations(ghidraRows, budgetSeconds) {
     decompiled_function_count: ghidraRows.reduce((total, row) => total + Math.max(0, Number(row?.decompiled_function_count) || 0), 0),
     decompilation_attempt_count: decompilationAttempts,
     decompilation_failure_count: decompilationFailures,
-    style_variation_count: styleVariations,
     analysis_pass_count: analysisPasses,
     analysis_budget_reached: budgetReached,
   };
@@ -866,7 +863,6 @@ function publicSummary(publicAudit, ghidraRows, sourceChanged, actualSha, explor
   const ghidraFailures = g.filter(row => row.analysis_status !== "completed").length;
   const decompilationAttempts = Number(exploration?.summary?.decompilation_attempt_count) || 0;
   const decompilationFailures = Number(exploration?.summary?.decompilation_failure_count) || 0;
-  const styleVariations = Number(exploration?.summary?.style_variation_count) || 0;
   const autoAnalysisTimeouts = g.filter(row => row.auto_analysis_timed_out === true).length;
   const decompilationFailureRate = decompilationAttempts ? decompilationFailures / decompilationAttempts : 0;
   const risks = [];
@@ -929,7 +925,6 @@ function publicSummary(publicAudit, ghidraRows, sourceChanged, actualSha, explor
     incomplete_check_count: (p.tool_failure_count || 0) + ghidraFailures + (exploration?.budget_reached === true ? 0 : 1) + (decompiled === 0 ? 1 : 0) + (decompilationFailureRate >= 0.25 ? 1 : 0),
     ghidra_decompilation_attempt_count: decompilationAttempts,
     ghidra_decompilation_failure_count: decompilationFailures,
-    ghidra_style_variation_count: styleVariations,
     exploration_seed_count: Number(exploration?.summary?.seed_count) || 0,
     exploration_node_count: Number(exploration?.summary?.visited_function_count) || 0,
     exploration_edge_count: Number(exploration?.summary?.edge_count) || 0,
@@ -1212,6 +1207,8 @@ async function main() {
           if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) row = parsed;
         } catch {}
       }
+      // Only reported exploration debits the active budget. The deadline
+      // separately accounts for wall time spent importing and preparing images.
       const elapsedReportedMs = Number(row?.exploration?.elapsed_seconds) * 1000;
       const elapsedForBudget = Number.isFinite(elapsedReportedMs) && elapsedReportedMs > 0 ? elapsedReportedMs : 0;
       remainingAnalysisMs = Math.max(0, remainingAnalysisMs - Math.min(sliceSeconds * 1000, elapsedForBudget));
