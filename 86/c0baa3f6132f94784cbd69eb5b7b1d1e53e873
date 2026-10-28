@@ -1,0 +1,23 @@
+relay.mjs
+  s_91a6d20d8a8e7b::t_d92bf20a7b5b54 206,209
+smoke/fixture-probe.py
+  s_91a6d20d8a8e7b::t_c37af2aac03c71 34-41,72-73
+smoke/isolation-smoke.mjs
+  s_91a6d20d8a8e7b::t_9a6e19799b9887 49-50,53-54,61-62,70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "86c0baa3f6132f94784cbd69eb5b7b1d1e53e873",
+  "prompts": {},
+  "sessions": {
+    "s_91a6d20d8a8e7b": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "f04e9d15-44c9-47d9-a011-d8d27c4273c8",
+        "model": "cursor-grok-4.6-xhigh"
+      },
+      "human_author": "Yuze Pan <145409865+yuzeguitarist@users.noreply.github.com>"
+    }
+  }
+}
