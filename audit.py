@@ -119,7 +119,7 @@ def image_audit(path, root):
         public["tool_failure_count"] += 1
         private["tool_failures"].append("macho_headers_failed")
 
-    code, defined = run_capture(["llvm-nm", "--macho", "--defined-only", str(path)], 15)
+    code, defined = run_capture(["llvm-nm", "--defined-only", str(path)], 15)
     if code == 0:
         lines = [x for x in defined.decode("utf-8", "replace").splitlines() if x.strip()]
         public["defined_symbol_count"] = len(lines)
@@ -128,7 +128,7 @@ def image_audit(path, root):
         public["tool_failure_count"] += 1
         private["tool_failures"].append("defined_symbols_failed")
 
-    code, undefined = run_capture(["llvm-nm", "--macho", "--undefined-only", str(path)], 15)
+    code, undefined = run_capture(["llvm-nm", "--undefined-only", str(path)], 15)
     if code == 0:
         lines = [x for x in undefined.decode("utf-8", "replace").splitlines() if x.strip()]
         public["undefined_symbol_count"] = len(lines)

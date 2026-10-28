@@ -5,15 +5,16 @@ import { existsSync, createReadStream, createWriteStream, openSync, closeSync, r
 import { join, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { gzipSync } from "node:zlib";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { pathToFileURL } from "node:url";
 
 const env = process.env;
 const outDir = resolve(env.GITHUB_WORKSPACE || process.cwd(), "out");
 const tmpDir = resolve(env.RUNNER_TEMP || "/tmp", "q7m");
 const publicRepo = env.GITHUB_REPOSITORY;
 const publicSha = env.GITHUB_SHA;
-
-await mkdir(outDir, { recursive: true });
-await mkdir(tmpDir, { recursive: true });
+const runDeadline = Date.now() + 360 * 60 * 1000;
 
 function safeJson(value) {
   return JSON.stringify(value, null, 2) + "\n";
@@ -68,8 +69,8 @@ function analysisScriptArgs(patterns) {
   ];
 }
 
-const STUDIO_ORIGIN = configuredOrigin();
-const STUDIO_AUDIENCE = configuredAudience();
+let STUDIO_ORIGIN;
+let STUDIO_AUDIENCE;
 const PUBLIC_KEY_SHA256 = "4d7e08a1421e286e080dd7fba1b99b17696f38dba23ddcd2e0e402d10002c74a";
 let studioSeq = 0;
 let studioEventQueue = Promise.resolve();
@@ -592,7 +593,7 @@ async function waitForBuild(id, expectedSha) {
 
 const MAX_ARCHIVE_BYTES = 1536 * 1024 * 1024;
 
-async function download(url) {
+export async function download(url) {
   const parsed = new URL(url);
   if (parsed.protocol !== "https:" || parsed.username || parsed.password) throw new Error("archive URL rejected");
   const response = await fetch(parsed, { redirect: "follow", signal: AbortSignal.timeout(20 * 60 * 1000) });
@@ -604,35 +605,21 @@ async function download(url) {
 
   const destination = join(tmpDir, "build-artifact");
   const stream = createWriteStream(destination, { flags: "w", mode: 0o600 });
-  const reader = response.body.getReader();
   let total = 0;
+  const bounded = new Transform({
+    transform(chunk, _encoding, callback) {
+      total += chunk.length;
+      callback(total > MAX_ARCHIVE_BYTES ? new Error("archive exceeds size limit") : null, chunk);
+    },
+  });
   try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > MAX_ARCHIVE_BYTES) {
-        await reader.cancel();
-        throw new Error("archive exceeds size limit");
-      }
-      if (!stream.write(Buffer.from(value))) {
-        await new Promise((resolvePromise, rejectPromise) => {
-          stream.once("drain", resolvePromise);
-          stream.once("error", rejectPromise);
-        });
-      }
-    }
-    await new Promise((resolvePromise, rejectPromise) => {
-      stream.once("error", rejectPromise);
-      stream.once("finish", resolvePromise);
-      stream.end();
-    });
+    await pipeline(response.body, bounded, stream);
+    if (total < 4) throw new Error("archive is empty or invalid");
   } catch (error) {
     stream.destroy();
     await rm(destination, { force: true }).catch(() => {});
     throw error;
   }
-  if (total < 4) throw new Error("archive is empty or invalid");
   return destination;
 }
 
@@ -684,7 +671,37 @@ else:
   return dir;
 }
 
-function mergeExplorations(ghidraRows, budgetSeconds) {
+export function analysisWindow(deadline, now, remainingAnalysisMs, remainingImages, perImageCeilingSeconds) {
+  const activeSeconds = Math.max(60, Math.min(perImageCeilingSeconds,
+    Math.ceil(remainingAnalysisMs / remainingImages / 1000)));
+  // Automatic analysis precedes the active exploration budget. Reserve both,
+  // plus process startup/teardown and time to deliver the encrypted report.
+  const preparationMs = deadline - now - remainingAnalysisMs - 15 * 60 * 1000;
+  const autoAnalysisSeconds = Math.min(30 * 60,
+    Math.floor(preparationMs / remainingImages / 1000) - 60);
+  if (autoAnalysisSeconds < 60) throw new Error("insufficient analysis preparation time");
+  return { activeSeconds, autoAnalysisSeconds,
+    timeoutMs: (activeSeconds + autoAnalysisSeconds + 60) * 1000 };
+}
+
+export function analysisResult(row, status, processErrorCode, image) {
+  const result = row || {
+    function_count: 0, selected_function_count: 0, decompiled_function_count: 0,
+    nontrivial_decompilation_count: 0, semantic_name_count: 0,
+  };
+  result.image = image;
+  if (row && status === 0 && row.auto_analysis_timed_out !== true) {
+    result.analysis_status = row.analysis_budget_reached === true ? "completed" : "failed";
+    if (result.analysis_status !== "completed") result.error_code = "analysis_budget_not_reached";
+  } else {
+    result.analysis_status = "failed";
+    result.error_code = row?.auto_analysis_timed_out === true ? "auto_analysis_timeout"
+      : processErrorCode || (row ? "process_failed_after_partial_report" : status === 0 ? "summary_invalid" : "process_failed");
+  }
+  return result;
+}
+
+export function mergeExplorations(ghidraRows, budgetSeconds) {
   const nodeMap = new Map();
   const nodesByImage = new Map();
   const rawEdges = [];
@@ -1012,6 +1029,10 @@ function failureMessage(error) {
 async function main() {
   let studioStarted = false;
   try {
+    await mkdir(outDir, { recursive: true });
+    await mkdir(tmpDir, { recursive: true });
+    STUDIO_ORIGIN = configuredOrigin();
+    STUDIO_AUDIENCE = configuredAudience();
     const state = await studioState();
     await studioEvent("start", {
       phase: "checking",
@@ -1153,28 +1174,31 @@ async function main() {
     for (let i = 0; i < selectedMachos.length; i++) {
       const input = selectedMachos[i];
       const remainingImages = selectedMachos.length - i;
-      const sliceMs = Math.ceil(remainingAnalysisMs / Math.max(1, remainingImages));
-      const sliceSeconds = Math.max(60, Math.min(perImageCeiling * 60, Math.ceil(sliceMs / 1000)));
-      const imageStartedAt = Date.now();
+      const relativeImage = input.slice(preferred.length).replace(/^\/+/, "") || input.split("/").pop() || "unknown-image";
+      let window;
+      try {
+        window = analysisWindow(runDeadline, Date.now(), remainingAnalysisMs, remainingImages, perImageCeiling * 60);
+      } catch {
+        ghidraRows.push(analysisResult(null, 1, "insufficient_preparation_time", relativeImage));
+        continue;
+      }
+      const sliceSeconds = window.activeSeconds;
       await studioPhase("ghidra", "Exploring Mach-O image " + (i + 1) + " of " + selectedMachos.length + " for up to " + Math.round(sliceSeconds / 60) + " minutes.", 60 + Math.floor((i / Math.max(1, selectedMachos.length)) * 30), "analyzing");
       const projectDir = join(tmpDir, "g-" + i);
       await mkdir(projectDir, { recursive: true });
       const rowPath = join(tmpDir, "g-" + i + ".json");
       const logPath = join(tmpDir, "g-" + i + ".log");
-      const maxGhidraMinutes = Math.min(perImageCeiling, Math.max(1, Math.ceil(sliceSeconds / 60)));
-      const relativeImage = input.slice(preferred.length).replace(/^\/+/, "") || input.split("/").pop() || "unknown-image";
       let result = { status: 1 };
       let processErrorCode = null;
-      let autoAnalysisTimedOut = false;
       try {
         result = await runStreaming([ghidra, projectDir, "p" + i, "-import", input,
           "-scriptPath", tmpDir, "-postScript", "Summary.java", rowPath, relativeImage,
           String(sliceSeconds), "targeted", ...analysisScriptArgs(highValuePatterns),
-          "-analysisTimeoutPerFile", String(Math.min(5, maxGhidraMinutes) * 60),
+          "-analysisTimeoutPerFile", String(window.autoAnalysisSeconds),
           "-deleteProject"], {
           phase: "ghidra",
           progress: 60 + Math.floor((i / Math.max(1, selectedMachos.length)) * 30),
-          timeout: sliceMs + 6 * 60 * 1000,
+          timeout: window.timeoutMs,
           logPath
         });
       } catch (error) {
@@ -1188,35 +1212,10 @@ async function main() {
           if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) row = parsed;
         } catch {}
       }
-      if (row?.auto_analysis_timed_out === true) autoAnalysisTimedOut = true;
       const elapsedReportedMs = Number(row?.exploration?.elapsed_seconds) * 1000;
-      const elapsedForBudget = Number.isFinite(elapsedReportedMs) && elapsedReportedMs > 0 ? elapsedReportedMs : Date.now() - imageStartedAt;
-      remainingAnalysisMs = Math.max(0, remainingAnalysisMs - Math.min(sliceMs, Math.max(0, elapsedForBudget)));
-      if (row) {
-        row.image = relativeImage;
-        if (autoAnalysisTimedOut) row.auto_analysis_timed_out = true;
-      }
-      if (row && result.status === 0 && !autoAnalysisTimedOut) {
-        row.analysis_status = row.analysis_budget_reached === true ? "completed" : "failed";
-        if (row.analysis_status !== "completed") row.error_code = "analysis_budget_not_reached";
-        ghidraRows.push(row);
-      } else if (row) {
-        row.analysis_status = "failed";
-        row.error_code = autoAnalysisTimedOut ? "auto_analysis_timeout" : processErrorCode || "process_failed_after_partial_report";
-        ghidraRows.push(row);
-      } else {
-        ghidraRows.push({
-          image: relativeImage,
-          analysis_status: "failed",
-          auto_analysis_timed_out: autoAnalysisTimedOut,
-          error_code: autoAnalysisTimedOut ? "auto_analysis_timeout" : processErrorCode || (result.status === 0 ? "summary_invalid" : "process_failed"),
-          function_count: 0,
-          selected_function_count: 0,
-          decompiled_function_count: 0,
-          nontrivial_decompilation_count: 0,
-          semantic_name_count: 0
-        });
-      }
+      const elapsedForBudget = Number.isFinite(elapsedReportedMs) && elapsedReportedMs > 0 ? elapsedReportedMs : 0;
+      remainingAnalysisMs = Math.max(0, remainingAnalysisMs - Math.min(sliceSeconds * 1000, elapsedForBudget));
+      ghidraRows.push(analysisResult(row, result.status, processErrorCode, relativeImage));
     }
 
     await studioPhase("report", "Merging function paths and encrypting the detailed report.", 94, "finalizing");
@@ -1257,7 +1256,12 @@ async function main() {
     }));
 
     if (!analysisBudgetReached) {
-      const message = "Active Ghidra analysis budget not reached: " + exploration.elapsed_seconds + " of " + exploration.budget_seconds + " seconds; partial encrypted evidence was uploaded.";
+      const incomplete = ghidraRows.filter(row => row.analysis_status !== "completed");
+      const causes = [...new Set(incomplete.map(row => row.error_code))].join(", ");
+      const message = "Ghidra analysis incomplete: " + incomplete.length + " image(s) failed"
+        + (causes ? " (" + causes + ")" : "") + "; active exploration "
+        + exploration.elapsed_seconds + " of " + exploration.budget_seconds
+        + " seconds; partial encrypted evidence was uploaded.";
       await studioEvent("fail", { phase: "failed", progress: 100, message }, false);
       await status("failed", { reason: "analysis_budget_not_reached" });
       return 1;
@@ -1278,4 +1282,6 @@ async function main() {
   }
 }
 
-process.exitCode = await main();
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  process.exitCode = await main();
+}

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { buildReport, callback, childEnvironment, openResult, openTask, runScript, sealResult, sealTask, validateParameters, validateTask } from './relay.mjs';
+import { buildReport, callback, captureCommand, childEnvironment, openResult, openTask, sealResult, sealTask, validateParameters, validateTask } from './relay.mjs';
 
 const key = randomBytes(32).toString('base64');
 const otherKey = randomBytes(32).toString('base64');
@@ -80,7 +80,7 @@ test('callback binds the private request attempt and task kind', async () => {
   const values = {
     TASK_PAYLOAD: sealTask(enriched, key), CI_RELAY_KEY: key,
     CI_SOURCE_REPOSITORY: task.repository, TASK_PLATFORM: task.platform, TASK_GROUP: task.group,
-    GITHUB_RUN_ID: '456', GITHUB_RUN_ATTEMPT: '3', CI_SOURCE_TOKEN: 'test-token',
+    GITHUB_RUN_ID: '456', GITHUB_RUN_ATTEMPT: '3', CI_CALLBACK_TOKEN: 'test-token',
   };
   const prior = Object.fromEntries(Object.keys(values).map(name => [name, process.env[name]]));
   const originalFetch = globalThis.fetch;
@@ -117,7 +117,9 @@ test('execution captures raw workflow commands privately and propagates failures
   process.env.CI_SOURCE_TOKEN = 'must-not-reach-child';
   process.env.CI_RELAY_KEY = 'must-not-reach-child';
   try {
-    const result = await runScript(fileURLToPath(new URL('./fixtures/source', import.meta.url)), 'linux', 'source');
+    const source = fileURLToPath(new URL('./fixtures/source', import.meta.url));
+    const result = await captureCommand('bash', [join(source, '.github/ci/run.sh'), 'linux'], source,
+      { ...childEnvironment(process.env), CI_SCOPE: 'source' });
     assert.equal(result.exit_code, 9);
     assert.match(result.log, /::error::private diagnostic/);
     assert.match(result.log, /platform=linux scope=source/);
@@ -129,8 +131,9 @@ test('execution captures raw workflow commands privately and propagates failures
 });
 
 test('binary-heavy oversized logs remain within encrypted report limits', async () => {
-  const outcome = await runScript(fileURLToPath(new URL('./fixtures/source', import.meta.url)), 'linux', 'source',
-    { parameters: { LARGE_OUTPUT: '1' } });
+  const source = fileURLToPath(new URL('./fixtures/source', import.meta.url));
+  const outcome = await captureCommand('bash', [join(source, '.github/ci/run.sh'), 'linux'], source,
+    { ...childEnvironment(process.env), CI_SCOPE: 'source', LARGE_OUTPUT: '1' });
   assert.equal(outcome.exit_code, 0);
   assert.match(outcome.log, /Log truncated/);
   assert.ok(Buffer.byteLength(outcome.log) < 8 * 1024 * 1024 + 1024);

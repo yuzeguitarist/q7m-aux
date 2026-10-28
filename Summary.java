@@ -30,7 +30,8 @@ public class Summary extends HeadlessScript {
     private static final int MAX_BFS_PATHS = 12;
     private static final int MAX_DEPTH = 10;
     private static final String[] DECOMPILER_STYLES = {
-        "decompile", "normalize", "paramid", "register", "firstpass"
+        // Other analysis modes produce intermediate trees rather than valid C.
+        "decompile"
     };
 
     private String outputPath;
