@@ -31,6 +31,14 @@ for name in os.environ:
 canary = "ISOLATION_SMOKE_PARENT_CANARY=synthetic-public-fixture-not-a-secret"
 result = {"platform": sys.argv[1], "uid": os.getuid(), "home": os.environ["HOME"]}
 require("host file denied", not os.access(config["hostCanary"], os.R_OK))
+try:
+    write_probe = Path("workspace-write-probe")
+    write_probe.write_text("synthetic-value-not-a-secret")
+    write_probe.unlink()
+    checks.append("workspace write and delete")
+except PermissionError as error:
+    raise RuntimeError("workspace write denied: uid=" + str(os.getuid())
+                       + " owner=" + str(Path.cwd().stat().st_uid)) from error
 
 if sys.argv[1] == "macos":
     require("different uid", os.getuid() != config["hostUid"])
@@ -61,6 +69,8 @@ if sys.argv[1] == "macos":
         require("own simulator set", (Path.home() / "Library/Developer/CoreSimulator/Devices" / simulator).exists())
         result["simulator"] = simulator
 else:
+    require("checkout owner uid", os.getuid() == config["hostUid"])
+    require("disposable home", os.environ["HOME"] == "/tmp")
     require("different pid namespace", os.readlink("/proc/self/ns/pid") != config["hostPidNamespace"])
     require("different mount namespace", os.readlink("/proc/self/ns/mnt") != config["hostMountNamespace"])
     require("no docker socket", not Path("/var/run/docker.sock").exists())
