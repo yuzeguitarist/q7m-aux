@@ -53,6 +53,7 @@ jobs:
           name: payload
           path: ${{ runner.temp }}/result/payload.bin
           retention-days: 1
+          overwrite: true
           if-no-files-found: error
           compression-level: 0
 
