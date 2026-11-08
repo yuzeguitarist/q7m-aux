@@ -26,20 +26,22 @@ const openedPart = (part, report = partReport(part)) =>
   openPart(sealPart(part, report, key), key, partitionedTask, publicRun, part);
 
 test('part artifacts authenticate encrypted reports with a separate key domain and fresh IV', () => {
-  const report = partReport(0);
-  const payload = sealPart(0, report, key);
-  assert.deepEqual(openPart(payload, key, partitionedTask, publicRun, 0),
-    { domain: 'part-v1', part: 0, report });
-  assert.equal(payload.includes(Buffer.from(report.log)), false);
-  assert.equal(payload.includes(Buffer.from(task.repository)), false);
-  assert.notDeepEqual(payload, sealPart(0, report, key));
-  assert.throws(() => openPart(payload, otherKey, partitionedTask, publicRun, 0));
-  assert.throws(() => openPart(payload, key, partitionedTask, publicRun, 1));
-  const altered = JSON.parse(payload);
-  altered.tag = randomBytes(16).toString('base64url');
-  assert.throws(() => openPart(Buffer.from(JSON.stringify(altered)), key, partitionedTask, publicRun, 0));
-  const taskEnvelope = Buffer.from(sealTask({ domain: 'part-v1', part: 0, report }, key), 'base64url');
-  assert.throws(() => openPart(taskEnvelope, key, partitionedTask, publicRun, 0));
+  for (const part of [0, 1, 2]) {
+    const report = partReport(part);
+    const payload = sealPart(part, report, key);
+    assert.deepEqual(openPart(payload, key, partitionedTask, publicRun, part),
+      { domain: 'part-v1', part, report });
+    assert.equal(payload.includes(Buffer.from(report.log)), false);
+    assert.equal(payload.includes(Buffer.from(task.repository)), false);
+    assert.notDeepEqual(payload, sealPart(part, report, key));
+    assert.throws(() => openPart(payload, otherKey, partitionedTask, publicRun, part));
+    assert.throws(() => openPart(payload, key, partitionedTask, publicRun, (part + 1) % 3));
+    const altered = JSON.parse(payload);
+    altered.tag = randomBytes(16).toString('base64url');
+    assert.throws(() => openPart(Buffer.from(JSON.stringify(altered)), key, partitionedTask, publicRun, part));
+    const taskEnvelope = Buffer.from(sealTask({ domain: 'part-v1', part, report }, key), 'base64url');
+    assert.throws(() => openPart(taskEnvelope, key, partitionedTask, publicRun, part));
+  }
 });
 
 test('every part report identity field and current public attempt must match', () => {
@@ -52,7 +54,7 @@ test('every part report identity field and current public attempt must match', (
   assert.throws(() => openPart(payload, key, partitionedTask, { ...publicRun, public_run_attempt: '4' }, 0));
   assert.throws(() => openPart(payload, key, { ...partitionedTask, sha: 'e'.repeat(40) }, publicRun, 0));
   assert.throws(() => openPart(payload, key, task, publicRun, 0));
-  assert.throws(() => sealPart(2, report, key));
+  assert.throws(() => sealPart(3, report, key));
   assert.throws(() => openPart(Buffer.alloc(16 * 1024 * 1024 + 1), key, partitionedTask, publicRun, 0));
 });
 
@@ -69,29 +71,32 @@ test('part report shape, exit status, log and metadata limits fail closed', () =
   assert.throws(() => validateParameters({ CI_EXECUTION_PART: '1' }));
 });
 
-test('combination requires both unique authenticated parts and propagates either failure', () => {
+test('combination requires all three unique authenticated parts and propagates every failure', () => {
   const first = openedPart(0);
   const second = openedPart(1);
+  const third = openedPart(2);
   assert.throws(() => combinePartReports([], partitionedTask, publicRun));
   assert.throws(() => combinePartReports([first], partitionedTask, publicRun));
-  assert.throws(() => combinePartReports([first, first], partitionedTask, publicRun));
-  assert.throws(() => combinePartReports([first, { ...second, part: 2 }], partitionedTask, publicRun));
-  assert.throws(() => combinePartReports([first, { ...second, domain: 'wrong' }], partitionedTask, publicRun));
-  assert.throws(() => combinePartReports([first, second], partitionedTask, { ...publicRun, public_run_attempt: '4' }));
-  assert.throws(() => combinePartReports([first, second], { ...partitionedTask, kind: 'site' }, publicRun));
-  for (const failed of [0, 1]) {
-    const report = combinePartReports([0, 1].map(part =>
+  assert.throws(() => combinePartReports([first, second], partitionedTask, publicRun));
+  assert.throws(() => combinePartReports([first, second, first], partitionedTask, publicRun));
+  assert.throws(() => combinePartReports([first, second, { ...third, part: 3 }], partitionedTask, publicRun));
+  assert.throws(() => combinePartReports([first, second, { ...third, domain: 'wrong' }], partitionedTask, publicRun));
+  assert.throws(() => combinePartReports([first, second, third], partitionedTask, { ...publicRun, public_run_attempt: '4' }));
+  assert.throws(() => combinePartReports([first, second, third], { ...partitionedTask, kind: 'site' }, publicRun));
+  for (const failed of [0, 1, 2]) {
+    const report = combinePartReports([0, 1, 2].map(part =>
       openedPart(part, partReport(part, { exit_code: failed === part ? 9 : 0 }))), partitionedTask, publicRun);
     assert.equal(report.exit_code, 9);
     assert.match(report.log, /=== Part 0 ===\nprivate part 0/);
     assert.match(report.log, /=== Part 1 ===\nprivate part 1/);
+    assert.match(report.log, /=== Part 2 ===\nprivate part 2/);
     assert.deepEqual(report.outputs, {});
   }
 });
 
 test('combined binary and Unicode logs fit the raw, JSON and encrypted result budgets', () => {
   for (const log of ['x'.repeat(8 * 1024 * 1024 - 2), '\0'.repeat(1_300_000), '\u{1f600}'.repeat(1_500_000)]) {
-    const parts = [0, 1].map(part => openedPart(part, partReport(part, { log })));
+    const parts = [0, 1, 2].map(part => openedPart(part, partReport(part, { log })));
     const report = combinePartReports(parts.reverse(), partitionedTask, publicRun);
     assert.match(report.log, /Log truncated/);
     assert.ok(Buffer.byteLength(report.log) <= 8 * 1024 * 1024);
@@ -103,13 +108,14 @@ test('combined binary and Unicode logs fit the raw, JSON and encrypted result bu
 test('combine CLI emits only encrypted complete or failure reports for missing and corrupt artifacts', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'relay-combine-'));
   try {
-    const files = [0, 1].map(part => join(directory, 'parts', `part-${part}`, 'part.bin'));
+    const files = [0, 1, 2].map(part => join(directory, 'parts', `part-${part}`, 'part.bin'));
     for (const file of files) await mkdir(join(file, '..'), { recursive: true });
     for (const mode of ['missing', 'corrupt', 'wrong-attempt', 'complete']) {
-      await rm(files[1], { force: true });
-      await writeFile(files[0], sealPart(0, partReport(0), key));
-      if (mode !== 'missing') await writeFile(files[1], mode === 'corrupt' ? Buffer.from('not an artifact')
-        : sealPart(1, { ...partReport(1), ...(mode === 'wrong-attempt' ? { public_run_attempt: '2' } : {}) }, key));
+      for (const part of [0, 1, 2]) await writeFile(files[part], sealPart(part, partReport(part), key));
+      if (mode === 'missing') await rm(files[2]);
+      if (mode === 'corrupt') await writeFile(files[0], 'not an artifact');
+      if (mode === 'wrong-attempt') await writeFile(files[1],
+        sealPart(1, { ...partReport(1), public_run_attempt: '2' }, key));
       const output = execFileSync(process.execPath, [fileURLToPath(new URL('./relay.mjs', import.meta.url)), 'combine'], {
         encoding: 'utf8', env: { ...childEnvironment(process.env), RUNNER_TEMP: directory,
           TASK_PAYLOAD: sealTask(partitionedTask, key), TASK_PLATFORM: 'macos', TASK_GROUP: task.group,
@@ -128,24 +134,29 @@ test('combine CLI emits only encrypted complete or failure reports for missing a
   }
 });
 
-test('legacy second parts never execute source and untrusted markers cannot enable partitioning', async () => {
+test('unassigned parts never execute legacy source and untrusted markers cannot enable partitioning', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'relay-part-marker-'));
   const source = join(directory, 'source');
   const marker = join(source, '.github/ci/parts');
   try {
     await mkdir(join(source, '.github/ci'), { recursive: true });
     await writeFile(join(source, '.github/ci/run.sh'), 'exit 99\n');
-    for (const content of [undefined, '1', '2'.repeat(17)]) {
+    for (const content of [undefined, '1', '4', '2'.repeat(17)]) {
       if (content !== undefined) await writeFile(marker, content);
-      const outcome = await runScript(source, 'macos', 'app', { part: 1 });
-      assert.equal(outcome.exit_code, 0);
-      assert.match(outcome.log, /Legacy task/);
+      for (const part of [1, 2]) {
+        const outcome = await runScript(source, 'macos', 'app', { part });
+        assert.equal(outcome.exit_code, 0);
+        assert.match(outcome.log, /no assigned execution part/);
+      }
     }
     await rm(marker);
     const target = join(directory, 'marker');
     await writeFile(target, '2\n');
     await symlink(target, marker);
     assert.equal((await runScript(source, 'macos', 'app', { part: 1 })).exit_code, 0);
+    await rm(marker);
+    await writeFile(marker, '2\n');
+    assert.equal((await runScript(source, 'macos', 'app', { part: 2 })).exit_code, 0);
     await assert.rejects(runScript(source, 'linux', 'app', { part: 0 }), /partitioned task/);
     await assert.rejects(runScript(source, 'macos', 'app', { part: '1' }), /execution part/);
   } finally {
@@ -170,13 +181,14 @@ test('part cleanup uses only current-run artifact names and leaves final payload
       const artifacts = url.endsWith('page=1')
         ? [{ id: 11, name: 'part-0' }, { id: 12, name: 'payload' },
           ...Array.from({ length: 98 }, (_, index) => ({ id: 100 + index, name: 'other' }))]
-        : [{ id: 22, name: 'part-1' }, { id: 23, name: 'part-2' }, { id: 24, name: 'part-0-other' }];
+        : [{ id: 22, name: 'part-1' }, { id: 23, name: 'part-2' }, { id: 24, name: 'part-0-other' }, { id: 25, name: 'part-9' }];
       return Response.json({ artifacts });
     };
     await cleanupParts();
     assert.deepEqual(deleted, [
       'https://api.github.com/repos/owner/executor/actions/artifacts/11',
       'https://api.github.com/repos/owner/executor/actions/artifacts/22',
+      'https://api.github.com/repos/owner/executor/actions/artifacts/23',
     ]);
     for (const change of [{ GITHUB_REPOSITORY: '../other' }, { GITHUB_RUN_ID: '0' }, { GITHUB_TOKEN: '' }]) {
       Object.assign(process.env, values, change);
