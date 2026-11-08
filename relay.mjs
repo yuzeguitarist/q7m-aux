@@ -122,6 +122,87 @@ export function buildReport(task, outcome, publicRun) {
   };
 }
 
+function validatePartNumber(part) {
+  if (part !== 0 && part !== 1) throw new Error('Invalid execution part');
+  return part;
+}
+
+function validatePartTask(task) {
+  validateTask(task, task.repository, 'macos');
+  if ((task.kind ?? 'checks') !== 'checks') throw new Error('Invalid partitioned task');
+}
+
+function validatePartReport(report, task, publicRun) {
+  const expected = buildReport(task, { exit_code: 0, log: '' }, publicRun);
+  if (!report || typeof report !== 'object' || Array.isArray(report)
+      || Object.keys(report).length !== Object.keys(expected).length
+      || !Number.isInteger(report.exit_code) || report.exit_code < 0 || report.exit_code > 255
+      || typeof report.log !== 'string' || Buffer.byteLength(report.log) > MAX_LOG
+      || Buffer.byteLength(JSON.stringify(report.log)) > MAX_LOG
+      || !report.outputs || typeof report.outputs !== 'object' || Array.isArray(report.outputs)
+      || Buffer.byteLength(JSON.stringify(report.outputs)) > 64 * 1024) throw new Error('Invalid part report');
+  for (const field of Object.keys(expected)) {
+    if (!['exit_code', 'log', 'outputs'].includes(field) && report[field] !== expected[field]) {
+      throw new Error('Part report identity mismatch');
+    }
+  }
+}
+
+function partKey(key, id, run, attempt) {
+  return createHmac('sha256', sharedKey(key)).update(`part-v1:${id}:${run}:${attempt}`).digest();
+}
+
+export function sealPart(part, report, key) {
+  validatePartNumber(part);
+  const result = Buffer.from(JSON.stringify({ v: 1, ...encrypt({ domain: 'part-v1', part, report },
+    partKey(key, report.id, report.public_run_id, report.public_run_attempt)) }));
+  if (result.length > MAX_REPORT) throw new Error('Invalid part size');
+  return result;
+}
+
+export function openPart(payload, key, task, publicRun, part) {
+  validatePartNumber(part);
+  validatePartTask(task);
+  if (Buffer.byteLength(payload) > MAX_REPORT) throw new Error('Invalid part size');
+  const envelope = JSON.parse(Buffer.from(payload).toString('utf8'));
+  if (envelope.v !== 1) throw new Error('Invalid part version');
+  const value = decrypt(envelope,
+    partKey(key, task.id, publicRun.public_run_id, publicRun.public_run_attempt));
+  if (value.domain !== 'part-v1' || value.part !== part) throw new Error('Invalid part identity');
+  validatePartReport(value.report, task, publicRun);
+  return value;
+}
+
+export function combinePartReports(parts, task, publicRun) {
+  validatePartTask(task);
+  if (!Array.isArray(parts) || parts.length !== 2
+      || new Set(parts.map(value => value?.part)).size !== 2) throw new Error('Missing or duplicate parts');
+  const reports = [0, 1].map(part => {
+    const value = parts.find(value => value?.part === part);
+    if (!value || value.domain !== 'part-v1') throw new Error('Invalid part identity');
+    validatePartReport(value.report, task, publicRun);
+    return value.report;
+  });
+  return buildReport(task, {
+    exit_code: reports.find(report => report.exit_code !== 0)?.exit_code ?? 0,
+    log: boundedLog(reports.map((report, part) => `=== Part ${part} ===\n${report.log}`).join('\n')),
+    outputs: {},
+  }, publicRun);
+}
+
+async function supportsParts(source) {
+  const marker = join(source, '.github/ci/parts');
+  try {
+    const metadata = await lstat(marker);
+    if (!metadata.isFile() || metadata.size > 16
+        || await realpath(marker) !== join(await realpath(source), '.github/ci/parts')) return false;
+    return (await readFile(marker, 'utf8')).trim() === '2';
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
 function taskFromEnvironment() {
   const task = validateTask(openTask(process.env.TASK_PAYLOAD, process.env.CI_RELAY_KEY),
     process.env.CI_SOURCE_REPOSITORY, process.env.TASK_PLATFORM);
@@ -182,8 +263,12 @@ export function childEnvironment(environment) {
 }
 
 export async function runScript(source, platform, scope, options = {}) {
-  const { kind = 'checks', parameters = {}, sha, metadataPath, trustedSiteScript } = options;
+  const { kind = 'checks', parameters = {}, sha, metadataPath, trustedSiteScript, part } = options;
   validateParameters(parameters);
+  if (part !== undefined) {
+    validatePartNumber(part);
+    if (platform !== 'macos' || scope !== 'app' || kind !== 'checks') throw new Error('Invalid partitioned task');
+  }
   if (kind === 'site' && !trustedSiteScript) throw new Error('Site tasks require a trusted runner script');
   const script = kind === 'site' ? trustedSiteScript : join(source, '.github/ci/run.sh');
   const canonicalSource = await realpath(source);
@@ -192,6 +277,8 @@ export async function runScript(source, platform, scope, options = {}) {
       || (kind !== 'site' && !canonicalScript.startsWith(canonicalSource + sep))) {
     throw new Error('Invalid script');
   }
+  const partitioned = part !== undefined && await supportsParts(canonicalSource);
+  if (part === 1 && !partitioned) return { exit_code: 0, log: 'Legacy task has no second part.\n' };
   const environment = { ...childEnvironment(process.env), ...parameters, CI_SCOPE: scope,
     ...(kind === 'site' ? { CI_SOURCE_DIRECTORY: canonicalSource } : {}),
     ...(sha ? { CI_SOURCE_SHA: sha } : {}),
@@ -219,6 +306,7 @@ export async function runScript(source, platform, scope, options = {}) {
   try {
     return await captureCommand('/usr/bin/sudo', [...isolated.args,
       `CI_SCOPE=${scope}`, ...Object.entries(parameters).map(([key, value]) => `${key}=${value}`),
+      ...(partitioned ? [`CI_EXECUTION_PART=${part}`] : []),
       '/bin/bash', `${isolated.source}/.github/ci/run.sh`, platform,
     ], '/', childEnvironment(process.env), isolated.stop);
   } finally { await isolated.cleanup(); }
@@ -266,21 +354,22 @@ export async function captureCommand(executable, args, cwd, environment, stop) {
       resolveRun(interruptedExitCode ?? code ?? (signal === 'SIGKILL' ? 124 : 128 + (signals[signal] ?? 0)));
     });
   });
-  let log = Buffer.concat(chunks).toString('utf8');
-  if (Buffer.byteLength(log) > MAX_LOG) {
-    log = Buffer.from(log).subarray(0, MAX_LOG).toString('utf8');
-    truncated = true;
-  }
-  while (Buffer.byteLength(JSON.stringify(log)) > MAX_LOG) {
-    log = log.slice(0, Math.max(0, Math.floor(log.length * MAX_LOG / Buffer.byteLength(JSON.stringify(log))) - 128));
-    truncated = true;
-  }
-  return { exit_code: exitCode, log: log + (truncated ? '\n[Log truncated at 8 MiB]\n' : '') };
+  return { exit_code: exitCode, log: boundedLog(Buffer.concat(chunks).toString('utf8'), truncated) };
 }
 
-async function execute() {
-  const task = taskFromEnvironment();
-  const publicRun = runFromEnvironment();
+function boundedLog(value, truncated = false) {
+  if (Buffer.byteLength(value) > MAX_LOG || Buffer.byteLength(JSON.stringify(value)) > MAX_LOG) truncated = true;
+  if (!truncated) return value;
+  const suffix = '\n[Log truncated at 8 MiB]\n';
+  let log = Buffer.from(value).subarray(0, MAX_LOG - 128).toString('utf8');
+  while (Buffer.byteLength(log + suffix) > MAX_LOG || Buffer.byteLength(JSON.stringify(log + suffix)) > MAX_LOG) {
+    log = log.slice(0, Math.max(0,
+      Math.floor(log.length * (MAX_LOG - 128) / Buffer.byteLength(JSON.stringify(log + suffix))) - 128));
+  }
+  return log + suffix;
+}
+
+async function produceReport(task, publicRun, part) {
   const directory = join(process.env.RUNNER_TEMP, `task-${task.id}`);
   const source = join(directory, 'source');
   const metadataPath = join(directory, '.relay-output.json');
@@ -303,7 +392,7 @@ async function execute() {
       await writeFile(trustedSiteScript, script, { mode: 0o600 });
     }
     outcome = await runScript(source, task.platform, task.scope, {
-      kind: task.kind ?? 'checks', parameters: task.parameters, sha: task.sha, metadataPath, trustedSiteScript,
+      kind: task.kind ?? 'checks', parameters: task.parameters, sha: task.sha, metadataPath, trustedSiteScript, part,
     });
     try {
       const metadata = await lstat(metadataPath);
@@ -321,11 +410,70 @@ async function execute() {
     outcome = { exit_code: 125, log: 'Task preparation failed.\n' };
   }
   const report = buildReport(task, outcome, publicRun);
-  const result = sealResult(report, process.env.CI_RESULT_PUBLIC_KEY, process.env.CI_RELAY_KEY);
+  report.log = boundedLog(report.log);
+  await rm(directory, { recursive: true, force: true });
+  return report;
+}
+
+async function storeResult(name, result) {
   const resultDirectory = join(process.env.RUNNER_TEMP, 'result');
   await mkdir(resultDirectory, { recursive: true, mode: 0o700 });
-  await writeFile(join(resultDirectory, 'payload.bin'), result, { mode: 0o600 });
-  await rm(directory, { recursive: true, force: true });
+  await writeFile(join(resultDirectory, name), result, { mode: 0o600 });
+}
+
+async function execute() {
+  const report = await produceReport(taskFromEnvironment(), runFromEnvironment());
+  await storeResult('payload.bin', sealResult(report, process.env.CI_RESULT_PUBLIC_KEY, process.env.CI_RELAY_KEY));
+}
+
+async function executePart() {
+  const task = taskFromEnvironment();
+  validatePartTask(task);
+  if (!['0', '1'].includes(process.env.TASK_PART)) throw new Error('Invalid execution part');
+  const part = Number(process.env.TASK_PART);
+  const report = await produceReport(task, runFromEnvironment(), part);
+  await storeResult('part.bin', sealPart(part, report, process.env.CI_RELAY_KEY));
+}
+
+async function combine() {
+  const task = taskFromEnvironment();
+  validatePartTask(task);
+  const publicRun = runFromEnvironment();
+  let report;
+  try {
+    const parts = await Promise.all([0, 1].map(async part => {
+      const file = join(process.env.RUNNER_TEMP, 'parts', `part-${part}`, 'part.bin');
+      const metadata = await lstat(file);
+      if (!metadata.isFile() || metadata.size > MAX_REPORT) throw new Error('Invalid part file');
+      return openPart(await readFile(file), process.env.CI_RELAY_KEY, task, publicRun, part);
+    }));
+    report = combinePartReports(parts, task, publicRun);
+  } catch {
+    report = buildReport(task, { exit_code: 125, log: 'Partitioned task results missing or invalid.\n' }, publicRun);
+  }
+  await storeResult('payload.bin', sealResult(report, process.env.CI_RESULT_PUBLIC_KEY, process.env.CI_RELAY_KEY));
+}
+
+export async function cleanupParts() {
+  const repository = process.env.GITHUB_REPOSITORY;
+  const run = process.env.GITHUB_RUN_ID;
+  const token = process.env.GITHUB_TOKEN;
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? '')
+      || repository.split('/').some(name => name === '.' || name === '..')
+      || !/^[1-9][0-9]{0,19}$/.test(run ?? '') || !token) throw new Error('Invalid cleanup context');
+  const ids = [];
+  for (let page = 1; ; page++) {
+    const response = await api(`repos/${repository}/actions/runs/${run}/artifacts?per_page=100&page=${page}`, {}, token);
+    const { artifacts } = await response.json();
+    if (!Array.isArray(artifacts)) throw new Error('Invalid artifacts');
+    for (const artifact of artifacts) {
+      if (!['part-0', 'part-1'].includes(artifact.name)) continue;
+      if (!Number.isSafeInteger(artifact.id) || artifact.id < 1) throw new Error('Invalid artifact id');
+      ids.push(artifact.id);
+    }
+    if (artifacts.length < 100) break;
+  }
+  for (const id of ids) await api(`repos/${repository}/actions/artifacts/${id}`, { method: 'DELETE' }, token);
 }
 
 export async function callback() {
@@ -351,6 +499,9 @@ function runFromEnvironment() {
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
     if (process.argv[2] === 'execute') await execute();
+    else if (process.argv[2] === 'execute-part') await executePart();
+    else if (process.argv[2] === 'combine') await combine();
+    else if (process.argv[2] === 'cleanup-parts') await cleanupParts();
     else if (process.argv[2] === 'callback') await callback();
     else throw new Error('Invalid operation');
   } catch {
