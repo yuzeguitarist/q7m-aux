@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { buildReport, callback, captureCommand, childEnvironment, cleanupParts, combinePartReports, openPart, openResult, openTask, runScript, sealPart, sealResult, sealTask, validateParameters, validateTask } from './relay.mjs';
+import { buildReport, callback, captureCommand, captureIsolated, childEnvironment, cleanupParts, combinePartReports, openPart, openResult, openTask, preparationDiagnostic, runScript, sealPart, sealResult, sealTask, validateParameters, validateTask } from './relay.mjs';
 
 const key = randomBytes(32).toString('base64');
 const otherKey = randomBytes(32).toString('base64');
@@ -208,6 +208,56 @@ test('part cleanup uses only current-run artifact names and leaves final payload
       else process.env[name] = value;
     }
   }
+});
+
+test('preparation diagnostics allow only safe error fields and redact bounded annotated stderr', () => {
+  const error = Object.assign(new Error('must-not-log-command-or-password'), {
+    code: 1, signal: 'SIGTERM', stage: 'security create-keychain',
+    stdout: 'must-not-log-stdout',
+    stderr: '\u001b[31mPermission denied secret-source secret-\u001b[31mjob secret-key secret-password\u001b[0m\n' + 'x'.repeat(3000),
+  });
+  const detail = JSON.parse(preparationDiagnostic(error, 'execute', 30_123, {
+    CI_SOURCE_READ_TOKEN: 'secret-source', GITHUB_TOKEN: 'secret-job',
+    CI_RELAY_KEY: 'secret-key', SERVICE_PASSWORD: 'secret-password',
+  }));
+  assert.equal(detail.phase, 'execute');
+  assert.equal(detail.elapsed_seconds, 30.123);
+  assert.equal(detail.name, 'Error');
+  assert.equal(detail.code, 1);
+  assert.equal(detail.signal, 'SIGTERM');
+  assert.equal(detail.stage, 'security create-keychain');
+  assert.match(detail.stderr, /^Permission denied \[REDACTED\]/);
+  assert.equal(detail.stderr.length, 2048);
+  assert.doesNotMatch(JSON.stringify(detail), /secret-source|secret-job|secret-key|secret-password|must-not-log|\u001b/);
+  const unannotated = JSON.parse(preparationDiagnostic({ name: 'secret-name', code: 'secret-code',
+    signal: 'secret-signal', stage: 'secret-stage', stderr: 'secret-stderr' }, 'secret-phase', Infinity));
+  assert.deepEqual(unannotated, { phase: 'unknown', elapsed_seconds: 0, name: 'Error' });
+  assert.equal(JSON.parse(preparationDiagnostic({ code: 'ENOENT' }, 'download', 1)).code, 'ENOENT');
+});
+
+test('isolation cleanup failure preserves captured private output and cannot turn green', async () => {
+  const failure = Object.assign(new Error('must-not-log-arguments'), {
+    code: 1, signal: 'SIGTERM', stage: 'rm', stderr: 'Permission denied\n',
+    cleanupOperations: [{ stage: 'launchctl bootout', elapsed: 31, failed: false },
+      { stage: 'rm', elapsed: 30_000, failed: true, code: 1, stderr: 'Permission denied\n' }],
+  });
+  const outcome = await captureIsolated(async () => ({ exit_code: 0, log: 'captured private test output\n' }),
+    async () => { throw failure; });
+  assert.equal(outcome.exit_code, 125);
+  assert.match(outcome.log, /captured private test output/);
+  assert.match(outcome.log, /Isolation cleanup failed/);
+  assert.match(outcome.log, /"stage":"rm"/);
+  assert.match(outcome.log, /Permission denied/);
+  assert.doesNotMatch(outcome.log, /must-not-log-arguments/);
+  assert.match(outcome.log, /Task timing.*isolation cleanup/);
+  const encrypted = sealResult(buildReport(task, outcome, publicRun), publicKey, key);
+  assert.equal(encrypted.includes(Buffer.from('captured private test output')), false);
+  assert.equal(openResult(encrypted, privateKey, key).exit_code, 125);
+  const retainedFailure = await captureIsolated(async () => ({ exit_code: 9, log: 'test failed\n' }), async () => []);
+  assert.equal(retainedFailure.exit_code, 9);
+  assert.match(retainedFailure.log, /test failed/);
+  const original = new TypeError('execution failed');
+  await assert.rejects(captureIsolated(async () => { throw original; }, async () => { throw failure; }), error => error === original);
 });
 
 test('task encryption hides metadata and authenticates it', () => {

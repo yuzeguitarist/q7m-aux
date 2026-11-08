@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { basename } from 'node:path';
 import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
@@ -10,8 +11,21 @@ export async function isolateMac(source, environment) {
   if (process.platform !== 'darwin') throw new Error('macOS isolation requires a macOS host');
   const user = `cfci${randomBytes(6).toString('hex')}`;
   const home = `/Users/${user}`;
-  const run = (file, args) => exec(file, args, { env: environment, timeout: 120_000, maxBuffer: 1024 * 1024 });
-  const root = (file, args) => run('/usr/bin/sudo', ['-n', file, ...args]);
+  const stage = (file, args) => {
+    const name = basename(file);
+    const verb = name === 'dscl' ? args[1].replace(/^-/, '')
+      : ['launchctl', 'security'].includes(name) ? args[0] : '';
+    return name + (verb ? ` ${verb}` : '');
+  };
+  const run = async (file, args, label = stage(file, args)) => {
+    try {
+      return await exec(file, args, { env: environment, timeout: 30_000, maxBuffer: 1024 * 1024 });
+    } catch (error) {
+      error.stage = label;
+      throw error;
+    }
+  };
+  const root = (file, args) => run('/usr/bin/sudo', ['-n', file, ...args], stage(file, args));
   const users = await run('/usr/bin/dscl', ['.', '-list', '/Users', 'UniqueID']);
   const used = new Set(users.stdout.trim().split('\n').map(line => Number(line.trim().split(/\s+/).at(-1))));
   const uid = Array.from({ length: 1000 }, (_, i) => 60000 + i).find(id => !used.has(id));
@@ -19,11 +33,28 @@ export async function isolateMac(source, environment) {
   let created = false;
   let bootstrapped = false;
   const cleanup = async () => {
-    if (!created) return;
-    if (bootstrapped) await root('/bin/launchctl', ['bootout', `user/${uid}`]).catch(() => {});
-    await root('/usr/bin/pkill', ['-KILL', '-u', String(uid)]).catch(() => {});
-    await root('/usr/bin/dscl', ['.', '-delete', `/Users/${user}`]).catch(() => {});
-    await root('/bin/rm', ['-rf', home]);
+    const operations = [];
+    if (!created) return operations;
+    const step = async (file, commandArgs, required = false) => {
+      const started = performance.now();
+      try {
+        await root(file, commandArgs);
+        operations.push({ stage: stage(file, commandArgs), elapsed: performance.now() - started, failed: false });
+      } catch (error) {
+        operations.push({ stage: error.stage, name: error.name, code: error.code,
+          signal: error.signal, stderr: error.stderr, elapsed: performance.now() - started, failed: true });
+        if (required) {
+          error.cleanupOperations = operations;
+          throw error;
+        }
+      }
+    };
+    await step('/usr/bin/pkill', ['-KILL', '-u', String(uid)]);
+    if (bootstrapped) await step('/bin/launchctl', ['bootout', `user/${uid}`]);
+    await step('/usr/bin/pkill', ['-KILL', '-u', String(uid)]);
+    await step('/usr/bin/dscl', ['.', '-delete', `/Users/${user}`]);
+    await step('/bin/rm', ['-rf', home], true);
+    return operations;
   };
   const args = [
     '-n', '/bin/launchctl', 'asuser', String(uid), '/usr/bin/sudo', '-n', '-u', user,
@@ -42,7 +73,7 @@ export async function isolateMac(source, environment) {
     await root('/bin/chmod', ['700', home]);
     await root('/bin/launchctl', ['bootstrap', `user/${uid}`]);
     bootstrapped = true;
-    const asUser = (file, commandArgs) => run('/usr/bin/sudo', [...args, file, ...commandArgs]);
+    const asUser = (file, commandArgs) => run('/usr/bin/sudo', [...args, file, ...commandArgs], stage(file, commandArgs));
     const keychain = `${home}/Library/Keychains/login.keychain-db`;
     await asUser('/usr/bin/security', ['create-keychain', '-p', '', keychain]);
     await asUser('/usr/bin/security', ['default-keychain', '-d', 'user', '-s', keychain]);
@@ -50,7 +81,8 @@ export async function isolateMac(source, environment) {
     await asUser('/usr/bin/security', ['unlock-keychain', '-p', '', keychain]);
     return { source: `${home}/source`, args, stop: () => root('/usr/bin/pkill', ['-KILL', '-u', String(uid)]), cleanup };
   } catch (error) {
-    await cleanup();
+    try { error.cleanupOperations = await cleanup(); }
+    catch (cleanupError) { error.cleanupOperations = cleanupError.cleanupOperations; }
     throw error;
   }
 }
