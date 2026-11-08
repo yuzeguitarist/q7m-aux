@@ -218,7 +218,8 @@ export async function runScript(source, platform, scope, options = {}) {
   const isolated = await isolateMac(canonicalSource, childEnvironment(process.env));
   try {
     return await captureCommand('/usr/bin/sudo', [...isolated.args,
-      `CI_SCOPE=${scope}`, '/bin/bash', `${isolated.source}/.github/ci/run.sh`, platform,
+      `CI_SCOPE=${scope}`, ...Object.entries(parameters).map(([key, value]) => `${key}=${value}`),
+      '/bin/bash', `${isolated.source}/.github/ci/run.sh`, platform,
     ], '/', childEnvironment(process.env), isolated.stop);
   } finally { await isolated.cleanup(); }
 }
