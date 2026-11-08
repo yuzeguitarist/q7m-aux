@@ -123,7 +123,7 @@ export function buildReport(task, outcome, publicRun) {
 }
 
 function validatePartNumber(part) {
-  if (part !== 0 && part !== 1) throw new Error('Invalid execution part');
+  if (part !== 0 && part !== 1 && part !== 2) throw new Error('Invalid execution part');
   return part;
 }
 
@@ -175,9 +175,9 @@ export function openPart(payload, key, task, publicRun, part) {
 
 export function combinePartReports(parts, task, publicRun) {
   validatePartTask(task);
-  if (!Array.isArray(parts) || parts.length !== 2
-      || new Set(parts.map(value => value?.part)).size !== 2) throw new Error('Missing or duplicate parts');
-  const reports = [0, 1].map(part => {
+  if (!Array.isArray(parts) || parts.length !== 3
+      || new Set(parts.map(value => value?.part)).size !== 3) throw new Error('Missing or duplicate parts');
+  const reports = [0, 1, 2].map(part => {
     const value = parts.find(value => value?.part === part);
     if (!value || value.domain !== 'part-v1') throw new Error('Invalid part identity');
     validatePartReport(value.report, task, publicRun);
@@ -190,15 +190,16 @@ export function combinePartReports(parts, task, publicRun) {
   }, publicRun);
 }
 
-async function supportsParts(source) {
+async function declaredPartCount(source) {
   const marker = join(source, '.github/ci/parts');
   try {
     const metadata = await lstat(marker);
     if (!metadata.isFile() || metadata.size > 16
-        || await realpath(marker) !== join(await realpath(source), '.github/ci/parts')) return false;
-    return (await readFile(marker, 'utf8')).trim() === '2';
+        || await realpath(marker) !== join(await realpath(source), '.github/ci/parts')) return 1;
+    const value = (await readFile(marker, 'utf8')).trim();
+    return value === '2' || value === '3' ? Number(value) : 1;
   } catch (error) {
-    if (error.code === 'ENOENT') return false;
+    if (error.code === 'ENOENT') return 1;
     throw error;
   }
 }
@@ -277,8 +278,9 @@ export async function runScript(source, platform, scope, options = {}) {
       || (kind !== 'site' && !canonicalScript.startsWith(canonicalSource + sep))) {
     throw new Error('Invalid script');
   }
-  const partitioned = part !== undefined && await supportsParts(canonicalSource);
-  if (part === 1 && !partitioned) return { exit_code: 0, log: 'Legacy task has no second part.\n' };
+  const count = part === undefined ? 1 : await declaredPartCount(canonicalSource);
+  if (part !== undefined && part >= count) return { exit_code: 0, log: 'Task has no assigned execution part.\n' };
+  const partitioned = part !== undefined && count > 1;
   const environment = { ...childEnvironment(process.env), ...parameters, CI_SCOPE: scope,
     ...(kind === 'site' ? { CI_SOURCE_DIRECTORY: canonicalSource } : {}),
     ...(sha ? { CI_SOURCE_SHA: sha } : {}),
@@ -429,7 +431,7 @@ async function execute() {
 async function executePart() {
   const task = taskFromEnvironment();
   validatePartTask(task);
-  if (!['0', '1'].includes(process.env.TASK_PART)) throw new Error('Invalid execution part');
+  if (!['0', '1', '2'].includes(process.env.TASK_PART)) throw new Error('Invalid execution part');
   const part = Number(process.env.TASK_PART);
   const report = await produceReport(task, runFromEnvironment(), part);
   await storeResult('part.bin', sealPart(part, report, process.env.CI_RELAY_KEY));
@@ -441,7 +443,7 @@ async function combine() {
   const publicRun = runFromEnvironment();
   let report;
   try {
-    const parts = await Promise.all([0, 1].map(async part => {
+    const parts = await Promise.all([0, 1, 2].map(async part => {
       const file = join(process.env.RUNNER_TEMP, 'parts', `part-${part}`, 'part.bin');
       const metadata = await lstat(file);
       if (!metadata.isFile() || metadata.size > MAX_REPORT) throw new Error('Invalid part file');
@@ -467,7 +469,7 @@ export async function cleanupParts() {
     const { artifacts } = await response.json();
     if (!Array.isArray(artifacts)) throw new Error('Invalid artifacts');
     for (const artifact of artifacts) {
-      if (!['part-0', 'part-1'].includes(artifact.name)) continue;
+      if (!['part-0', 'part-1', 'part-2'].includes(artifact.name)) continue;
       if (!Number.isSafeInteger(artifact.id) || artifact.id < 1) throw new Error('Invalid artifact id');
       ids.push(artifact.id);
     }
