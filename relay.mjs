@@ -305,13 +305,11 @@ export async function runScript(source, platform, scope, options = {}) {
   }
   if (platform !== 'macos') throw new Error('Unsupported execution platform');
   const isolated = await isolateMac(canonicalSource, childEnvironment(process.env));
-  try {
-    return await captureCommand('/usr/bin/sudo', [...isolated.args,
+  return captureIsolated(() => captureCommand('/usr/bin/sudo', [...isolated.args,
       `CI_SCOPE=${scope}`, ...Object.entries(parameters).map(([key, value]) => `${key}=${value}`),
       ...(partitioned ? [`CI_EXECUTION_PART=${part}`] : []),
       '/bin/bash', `${isolated.source}/.github/ci/run.sh`, platform,
-    ], '/', childEnvironment(process.env), isolated.stop);
-  } finally { await isolated.cleanup(); }
+    ], '/', childEnvironment(process.env), isolated.stop), isolated.cleanup);
 }
 
 // Capturing and cancellation are tested independently of the OS isolation layer.
@@ -371,15 +369,84 @@ function boundedLog(value, truncated = false) {
   return log + suffix;
 }
 
+export function preparationDiagnostic(error, phase, elapsed, environment = process.env) {
+  const detail = {
+    phase: ['download', 'extract', 'execute', 'metadata', 'cleanup'].includes(phase) ? phase : 'unknown',
+    elapsed_seconds: Number.isFinite(elapsed) && elapsed >= 0 ? Math.round(elapsed) / 1000 : 0,
+    name: ['Error', 'TypeError', 'RangeError', 'SyntaxError', 'AbortError', 'TimeoutError'].includes(error?.name)
+      ? error.name : 'Error',
+  };
+  if (Number.isInteger(error?.code) && error.code >= 0 && error.code <= 255
+      || /^(?:ENOENT|EACCES|EPERM|EEXIST|ENOTDIR|ENOSPC|EIO|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAGAIN|ERR_CHILD_PROCESS_STDIO_MAXBUFFER)$/.test(error?.code)) {
+    detail.code = error.code;
+  }
+  if (/^SIG(?:TERM|KILL|ABRT|INT|SEGV|BUS|PIPE|HUP)$/.test(error?.signal)) detail.signal = error.signal;
+  if (/^(?:dscl (?:list|create|delete)|launchctl (?:bootstrap|bootout|asuser)|security (?:create-keychain|default-keychain|set-keychain-settings|unlock-keychain)|mkdir|mv|chown|chmod|pkill|rm)$/.test(error?.stage)) {
+    detail.stage = error.stage;
+    if (typeof error.stderr === 'string') {
+      let stderr = error.stderr.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+        .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, '');
+      for (const [name, value] of Object.entries(environment)) {
+        if (/TOKEN|KEY|SECRET|PASSWORD/i.test(name) && typeof value === 'string' && value.length >= 4) {
+          stderr = stderr.replaceAll(value, '[REDACTED]');
+        }
+      }
+      detail.stderr = stderr.slice(0, 2048);
+    }
+  }
+  return JSON.stringify(detail);
+}
+
+function cleanupDiagnostics(operations) {
+  if (!Array.isArray(operations)) return '';
+  return operations.slice(0, 8).map(operation => `Isolation cleanup ${operation.failed ? 'failed' : 'completed'}. ${
+    preparationDiagnostic(operation, 'cleanup', operation.elapsed)}`).join('\n');
+}
+
+export async function captureIsolated(run, cleanup) {
+  let outcome;
+  let executionError;
+  try { outcome = await run(); } catch (error) { executionError = error; }
+  const started = performance.now();
+  let operations;
+  try { operations = await cleanup(); }
+  catch (error) {
+    operations = error.cleanupOperations;
+    if (!outcome) executionError ??= error;
+    else {
+      outcome.exit_code = 125;
+      outcome.log += `\nIsolation cleanup failed. ${preparationDiagnostic(error, 'cleanup', performance.now() - started)}\n`;
+    }
+  }
+  if (executionError) {
+    executionError.cleanupOperations = operations;
+    throw executionError;
+  }
+  outcome.log = boundedLog(`${outcome.log}\n${cleanupDiagnostics(operations)}\n[Task timing] isolation cleanup: ${
+    ((performance.now() - started) / 1000).toFixed(3)}s\n`);
+  return outcome;
+}
+
 async function produceReport(task, publicRun, part) {
   const directory = join(process.env.RUNNER_TEMP, `task-${task.id}`);
   const source = join(directory, 'source');
   const metadataPath = join(directory, '.relay-output.json');
-  await mkdir(source, { recursive: true, mode: 0o700 });
+  const started = performance.now();
+  let phase = 'download';
+  let phaseStarted = started;
+  const timings = [];
+  const finishPhase = () => timings.push(`[Task timing] ${phase}: ${((performance.now() - phaseStarted) / 1000).toFixed(3)}s`);
+  const nextPhase = name => {
+    finishPhase();
+    phase = name;
+    phaseStarted = performance.now();
+  };
   let outcome;
   try {
+    await mkdir(source, { recursive: true, mode: 0o700 });
     const archive = join(directory, 'source.tar.gz');
     await downloadSource(task, archive);
+    nextPhase('extract');
     await command('tar', ['-xzf', archive, '--strip-components=1', '-C', source], { env: childEnvironment(process.env) });
     await rm(archive);
     let trustedSiteScript;
@@ -393,9 +460,11 @@ async function produceReport(task, publicRun, part) {
       trustedSiteScript = join(directory, 'trusted-site.sh');
       await writeFile(trustedSiteScript, script, { mode: 0o600 });
     }
+    nextPhase('execute');
     outcome = await runScript(source, task.platform, task.scope, {
       kind: task.kind ?? 'checks', parameters: task.parameters, sha: task.sha, metadataPath, trustedSiteScript, part,
     });
+    nextPhase('metadata');
     try {
       const metadata = await lstat(metadataPath);
       if (!metadata.isFile() || metadata.size > 64 * 1024) throw new Error('Invalid metadata');
@@ -405,15 +474,25 @@ async function produceReport(task, publicRun, part) {
     } catch (error) {
       if (error.code !== 'ENOENT') {
         outcome.exit_code = 125;
-        outcome.log += '\nTask metadata invalid.\n';
+        outcome.log += `\nTask metadata invalid. ${preparationDiagnostic(error, phase, performance.now() - phaseStarted)}\n`;
       }
     }
-  } catch {
-    outcome = { exit_code: 125, log: 'Task preparation failed.\n' };
+  } catch (error) {
+    outcome = { exit_code: 125,
+      log: `Task preparation failed. ${preparationDiagnostic(error, phase, performance.now() - phaseStarted)}\n${
+        cleanupDiagnostics(error.cleanupOperations)}\n` };
   }
+  nextPhase('cleanup');
+  try {
+    await rm(directory, { recursive: true, force: true });
+  } catch (error) {
+    outcome.exit_code = 125;
+    outcome.log += `Task cleanup failed. ${preparationDiagnostic(error, phase, performance.now() - phaseStarted)}\n`;
+  }
+  finishPhase();
+  outcome.log += `\n${timings.join('\n')}\n[Task timing] total: ${((performance.now() - started) / 1000).toFixed(3)}s\n`;
   const report = buildReport(task, outcome, publicRun);
   report.log = boundedLog(report.log);
-  await rm(directory, { recursive: true, force: true });
   return report;
 }
 
